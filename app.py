@@ -5,19 +5,27 @@ dashboard - no command line needed after the first `python app.py`.
     python app.py
     open http://127.0.0.1:5000
 
-Runs entirely on localhost. Starting a run just launches `run.py` as a
-background subprocess (the same script the CLI uses) and streams progress
-via the same report.html the CLI already writes after every site.
+By default this only listens on localhost. To let others on your network
+reach it (AGENT_HOST=0.0.0.0), set AGENT_PASSWORD first - every request then
+requires a password (a login page, cookie-based - no username). Without
+AGENT_PASSWORD set, binding to 0.0.0.0 is refused, so this can't accidentally
+go passwordless on the network.
+
+Starting a run just launches `run.py` as a background subprocess (the same
+script the CLI uses) and streams progress via the same report.html the CLI
+already writes after every site.
 """
 from __future__ import annotations
 
+import os
+import secrets
 import subprocess
 import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 from werkzeug.utils import secure_filename
 
 from agent.config import Config, default_config_path
@@ -26,12 +34,87 @@ ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = ROOT / "uploads"
 ALLOWED_EXT = {".xlsx", ".xls", ".csv", ".tsv"}
 
+AGENT_HOST = os.environ.get("AGENT_HOST", "127.0.0.1")
+AGENT_PORT = int(os.environ.get("AGENT_PORT", "5000"))
+AGENT_PASSWORD = os.environ.get("AGENT_PASSWORD", "")
+
+if AGENT_HOST != "127.0.0.1" and not AGENT_PASSWORD:
+    raise SystemExit(
+        "AGENT_HOST is set to listen beyond localhost, but AGENT_PASSWORD is not set. "
+        "Set AGENT_PASSWORD before exposing this to your network - see .env.local.example."
+    )
+
 cfg = Config.load(default_config_path(ROOT))
 REPORT_PATH = cfg.resolve(cfg.path("paths", "report_path", default="output/report.html"))
 EVIDENCE_DIR = cfg.resolve(cfg.path("paths", "evidence_dir", default="evidence"))
 LAUNCH_LOG = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log")).with_name("webapp_launch.log")
 
 app = Flask(__name__)
+
+# Session signing key - generated once, persisted locally so logins survive
+# a service restart. Never committed (gitignored, and it's a local run artifact).
+_SECRET_PATH = ROOT / ".flask_secret"
+if _SECRET_PATH.exists():
+    app.secret_key = _SECRET_PATH.read_text().strip()
+else:
+    app.secret_key = secrets.token_hex(32)
+    _SECRET_PATH.write_text(app.secret_key)
+
+# Explicit, not relying on defaults: this serves plain HTTP on purpose (a
+# local LAN tool), so Secure=True would silently make every cookie useless.
+app.config.update(
+    SESSION_COOKIE_SECURE=False,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
+LOGIN_HTML = """<!doctype html>
+<meta charset="utf-8"><title>Outreach agent - sign in</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0;
+    background: #f8f9fa; font: 15px system-ui, -apple-system, sans-serif; }
+  @media (prefers-color-scheme: dark) { body { background: #0f172a; color: #f8fafc; } }
+  form { background: #fff; border: 1px solid rgba(15,23,42,.08); border-radius: 12px; padding: 32px;
+    width: 280px; box-shadow: 0 1px 24px rgba(0,0,0,.06); }
+  @media (prefers-color-scheme: dark) { form { background: #1e293b; border-color: rgba(255,255,255,.08); } }
+  h1 { font-size: 17px; margin: 0 0 18px; }
+  input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(15,23,42,.15);
+    font-size: 14px; box-sizing: border-box; margin-bottom: 12px; }
+  button { width: 100%; padding: 10px; border-radius: 8px; border: 0; background: #2563eb; color: #fff;
+    font-weight: 600; cursor: pointer; font-size: 14px; }
+  .err { color: #d03b3b; font-size: 13px; margin: -4px 0 12px; }
+</style>
+<form method="post">
+  <h1>Outreach agent</h1>
+  __ERROR__
+  <input type="password" name="password" placeholder="Password" autofocus required>
+  <button type="submit">Sign in</button>
+</form>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = ""
+    if request.method == "POST":
+        if request.form.get("password") == AGENT_PASSWORD:
+            session["authed"] = True
+            session.permanent = True
+            return redirect(request.args.get("next") or "/")
+        error = '<div class="err">Incorrect password</div>'
+    return LOGIN_HTML.replace("__ERROR__", error)
+
+
+@app.before_request
+def _require_auth():
+    if not AGENT_PASSWORD or request.path == "/login":
+        return None
+    if session.get("authed"):
+        return None
+    if request.path.startswith("/files/") or request.path == "/status":
+        return Response("Authentication required", 401)
+    return redirect(f"/login?next={request.path}")
 
 _lock = threading.Lock()
 STATE: dict = {"proc": None, "input": None, "live": False, "started_at": None}
@@ -148,7 +231,7 @@ INDEX_HTML = r"""<!doctype html>
 
   :root {
     color-scheme: light;
-    --surface-1: #ffffff; --surface-2: #f1f5f9; --plane: #f8f9fa; --text-1: #0f172a; --text-2: #475569;
+    --surface-1: #f1f5f9; --surface-2: #e2e8f0; --plane: #ffffff; --text-1: #0f172a; --text-2: #475569;
     --muted: #94a3b8; --grid: #e2e8f0; --border: rgba(15,23,42,0.08); --accent: #2563eb;
     --accent-2: #0d9488;
     --blob-1: #2563eb; --blob-2: #0d9488; --blob-3: #2563eb; --blob-4: #0d9488;
@@ -204,10 +287,21 @@ INDEX_HTML = r"""<!doctype html>
     @keyframes hueflow { 0%, 100% { background-position: 0% center; } 50% { background-position: 100% center; } }
   }
   .sub { color: var(--text-2); font-size: 13px; margin: 0 0 28px; }
+
+  .live-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    background: var(--surface-1); border: 1.5px solid var(--border); border-radius: 12px;
+    padding: 14px 20px; margin-bottom: 20px; transition: background .2s, border-color .2s; }
+  .live-banner-label { font-size: 14px; font-weight: 600; }
+  .live-banner.is-live { background: color-mix(in srgb, var(--critical) 10%, var(--surface-1));
+    border-color: var(--critical); }
+  .switch-lg { width: 50px; height: 28px; }
+  .switch-lg .knob { width: 24px; height: 24px; }
+  .switch-lg input:checked + .track + .knob { transform: translateX(22px); }
   .layout { display: grid; grid-template-columns: minmax(280px, 340px) 1fr; gap: 20px; align-items: start; }
   @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
-  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px;
-    box-shadow: 0 1px 24px rgba(0,0,0,.04); }
+  .card { background: var(--surface-1); border: 1px solid color-mix(in srgb, var(--text-1) 12%, transparent);
+    border-radius: 12px; padding: 20px 22px;
+    box-shadow: 0 2px 10px rgba(15,23,42,.07), 0 1px 2px rgba(15,23,42,.05); }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-2);
     margin: 0 0 16px; font-weight: 600; }
   @media (prefers-reduced-motion: no-preference) {
@@ -240,10 +334,11 @@ INDEX_HTML = r"""<!doctype html>
     background: var(--plane); color: var(--text-1); font-size: 13px; }
   .switch { position: relative; width: 38px; height: 22px; flex: none; }
   .switch input { opacity: 0; width: 100%; height: 100%; margin: 0; position: absolute; cursor: pointer; }
-  .switch .track { position: absolute; inset: 0; background: var(--grid); border-radius: 999px; transition: background .2s; }
+  .switch .track { position: absolute; inset: 0; background: var(--grid); border: 1px solid var(--muted);
+    border-radius: 999px; transition: background .2s, border-color .2s; }
   .switch .knob { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
     background: var(--surface-1); box-shadow: 0 1px 2px var(--border); transition: transform .2s cubic-bezier(.34,1.56,.64,1); }
-  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track { background: var(--accent); border-color: transparent; }
   .switch input:checked + .track + .knob { transform: translateX(16px); }
   #live:checked + .track { background: var(--critical); }
   #headless:checked + .track { background: var(--accent-2); }
@@ -259,9 +354,11 @@ INDEX_HTML = r"""<!doctype html>
   .btn-primary:hover:not(:disabled) { transform: translateY(-1px); background-position: 100% 0;
     box-shadow: 0 6px 20px color-mix(in srgb, var(--accent-2) 45%, transparent); }
   .btn-primary:active:not(:disabled) { transform: translateY(0); }
-  .btn-stop { background: transparent; border-color: var(--border); color: var(--critical); width: 100%; margin-top: 10px;
-    transition: transform .15s ease, background .15s ease; }
-  .btn-stop:hover:not(:disabled) { background: color-mix(in srgb, var(--critical) 10%, transparent); transform: translateY(-1px); }
+  .btn-stop { background: var(--critical); border-color: transparent; color: #fff; width: 100%; margin-top: 10px;
+    box-shadow: 0 4px 14px color-mix(in srgb, var(--critical) 35%, transparent);
+    transition: transform .15s ease, box-shadow .15s ease, filter .15s ease; }
+  .btn-stop:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
+  .btn-stop:active:not(:disabled) { transform: translateY(0); }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   .status-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 4px 10px;
@@ -294,6 +391,11 @@ INDEX_HTML = r"""<!doctype html>
 
 <div class="bg-blobs" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
 
+<div class="live-banner" id="liveBanner">
+  <span class="live-banner-label">Live mode <span class="hint">(off = dry run, nothing sent &middot; on = real submissions/emails)</span></span>
+  <label class="switch switch-lg"><input type="checkbox" id="live"><span class="track"></span><span class="knob"></span></label>
+</div>
+
 <h1>Outreach agent</h1>
 <p class="sub">Upload a leads spreadsheet and start a run - the dashboard on the right updates live.</p>
 
@@ -310,10 +412,6 @@ INDEX_HTML = r"""<!doctype html>
     <div class="error-msg" id="err"></div>
 
     <fieldset>
-      <div class="row">
-        <span>Live mode <span class="hint">(off = dry run, nothing sent)</span></span>
-        <label class="switch"><input type="checkbox" id="live"><span class="track"></span><span class="knob"></span></label>
-      </div>
       <div class="row">
         <span>Show browser window</span>
         <label class="switch"><input type="checkbox" id="headless" checked><span class="track"></span><span class="knob"></span></label>
@@ -348,6 +446,12 @@ INDEX_HTML = r"""<!doctype html>
   const pillText = document.getElementById('pillText');
   const dashWrap = document.getElementById('dashWrap');
   const placeholder = document.getElementById('placeholder');
+  const liveToggle = document.getElementById('live');
+  const liveBanner = document.getElementById('liveBanner');
+
+  liveToggle.addEventListener('change', () => {
+    liveBanner.classList.toggle('is-live', liveToggle.checked);
+  });
 
   let uploadedPath = null;
   let iframe = null;
@@ -420,14 +524,34 @@ INDEX_HTML = r"""<!doctype html>
     lastPillState = state;
   }
 
+  function checkFrameAuth(frame) {
+    // Same-origin, so the iframe's own document is readable directly. If the
+    // session cookie ever goes stale mid-visit (seen intermittently on some
+    // browsers with bare-IP addresses), the iframe silently shows the raw
+    // "Authentication required" response instead of the dashboard - recover
+    // by sending the whole page to a fresh login rather than leaving it dead.
+    try {
+      const text = frame.contentDocument && frame.contentDocument.body
+        ? frame.contentDocument.body.innerText.trim() : '';
+      if (text === 'Authentication required') {
+        window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+      }
+    } catch (e) { /* cross-origin or not loaded yet - ignore */ }
+  }
+
   async function poll() {
     const res = await fetch('/status');
+    if (res.status === 401) {
+      window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+      return;
+    }
     const s = await res.json();
     if (s.report_ready) {
       const frame = ensureIframe();
       const wanted = s.report_url + '?t=' + Math.floor(Date.now() / 3000);
       if (!frame.dataset.base || frame.dataset.base !== s.report_url) {
         frame.dataset.base = s.report_url;
+        frame.addEventListener('load', () => checkFrameAuth(frame));
         frame.src = wanted;
       } else if (s.running) {
         frame.src = wanted; // periodic refresh while a run is active
@@ -459,4 +583,6 @@ INDEX_HTML = r"""<!doctype html>
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    print(f"Outreach agent listening on http://{AGENT_HOST}:{AGENT_PORT}"
+          + (" (password required)" if AGENT_PASSWORD else " (no password - localhost only)"))
+    app.run(host=AGENT_HOST, port=AGENT_PORT, debug=False)

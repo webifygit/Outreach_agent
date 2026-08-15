@@ -50,6 +50,7 @@ email_senders:
     first_name: "First"
     last_name: "Person"
     email: "you@gmail.com"
+    signature_email: ""   # optional - shown in the HTML signature instead of the address above
     phone: "+1 000 000 0000"
     designation: "Job Title"
     smtp_password_env: "SMTP_PASSWORD_SALES"
@@ -87,7 +88,10 @@ email:
   smtp_port: 587
   subject_template: "Partnership enquiry"
   body_template_path: "templates/email_body.txt.j2"
-  html_template_path: ""   # optional, leave blank for plain text only
+  # optional; leave blank for plain text only. "templates/email_body_html.j2"
+  # adds a rich HTML signature (logo + styled name block) - needs a logo at
+  # templates/assets/<yours>.png and agent/mailer.py's LOGO_PATH/LOGO_CID updated to match.
+  html_template_path: ""
   daily_limit: 50          # hard stop - protects your sending reputation
   per_send_delay: [20, 60]
 

@@ -84,6 +84,15 @@ def _bar_row(label: str, count: int, max_count: int, color: str) -> str:
     </div>"""
 
 
+def _shot_cell(path: str, label: str) -> str:
+    if path.lower().endswith(".png"):
+        return (
+            f'<a href="{_esc(path)}" class="shot-link" title="Open {_esc(label)} screenshot">'
+            f'<img src="{_esc(path)}" alt="{_esc(label)} screenshot" loading="lazy" class="shot-thumb"></a>'
+        )
+    return f'<a href="{_esc(path)}" class="shot-text-link">{_esc(label)}</a>'  # e.g. the emailed .txt copy
+
+
 def _table_row(r: dict, report_dir: Path) -> str:
     status = str(r.get("status") or "")
     sender = str(r.get("sender") or "")
@@ -92,10 +101,14 @@ def _table_row(r: dict, report_dir: Path) -> str:
     timestamp = str(r.get("timestamp") or "")
     before = _rel_link(r.get("screenshot_before", ""), report_dir)
     after = _rel_link(r.get("screenshot_after", ""), report_dir)
-    shots = " &middot; ".join(
-        f'<a href="{_esc(p)}" target="_blank" rel="noopener">{label}</a>'
-        for p, label in ((before, "before"), (after, "after")) if p
-    ) or '<span class="muted">&mdash;</span>'
+    # No target="_blank": HTTP Basic Auth (used when this is served over the
+    # network) doesn't reliably carry into a freshly opened tab in every
+    # browser - same-tab navigation guarantees the existing authenticated
+    # session applies. Thumbnails also mean most screenshots are visible
+    # without any navigation at all.
+    shots = "".join(_shot_cell(p, label) for p, label in ((before, "before"), (after, "after")) if p) or (
+        '<span class="muted">&mdash;</span>'
+    )
     detail = str(r.get("detail") or "")
     search = " ".join(str(r.get(k, "")) for k in ("website", "company_name", "detail", "email_used")).lower()
     return f"""
@@ -120,9 +133,9 @@ PAGE = Template(r"""<!doctype html>
 <style>
   :root {
     color-scheme: light;
-    --surface-1:  #ffffff;
-    --surface-2:  #f1f5f9;
-    --plane:      #f8f9fa;
+    --surface-1:  #f1f5f9;
+    --surface-2:  #e2e8f0;
+    --plane:      #ffffff;
     --text-1:     #0f172a;
     --text-2:     #475569;
     --muted:      #94a3b8;
@@ -132,7 +145,7 @@ PAGE = Template(r"""<!doctype html>
     --accent-2:   #0d9488;
     --critical:   #d03b3b;
     --blob-1: #2563eb; --blob-2: #0d9488; --blob-3: #2563eb; --blob-4: #0d9488;
-    --blob-opacity: .10;
+    --blob-opacity: .22;
     --cat-1: #2563eb; --cat-2: #0d9488; --cat-3: #60a5fa; --cat-4: #2dd4bf;
     --cat-5: #1d4ed8; --cat-6: #0f766e; --cat-7: #93c5fd; --cat-8: #5eead4;
   }
@@ -151,7 +164,7 @@ PAGE = Template(r"""<!doctype html>
       --accent-2:   #14b8a6;
       --critical:   #e66767;
       --blob-1: #3b82f6; --blob-2: #14b8a6; --blob-3: #3b82f6; --blob-4: #14b8a6;
-      --blob-opacity: .16;
+      --blob-opacity: .3;
       --cat-1: #3b82f6; --cat-2: #14b8a6; --cat-3: #93c5fd; --cat-4: #5eead4;
       --cat-5: #60a5fa; --cat-6: #2dd4bf; --cat-7: #bfdbfe; --cat-8: #99f6e4;
     }
@@ -170,7 +183,7 @@ PAGE = Template(r"""<!doctype html>
     --accent-2:   #14b8a6;
     --critical:   #e66767;
     --blob-1: #3b82f6; --blob-2: #14b8a6; --blob-3: #3b82f6; --blob-4: #14b8a6;
-    --blob-opacity: .16;
+    --blob-opacity: .3;
     --cat-1: #3b82f6; --cat-2: #14b8a6; --cat-3: #93c5fd; --cat-4: #5eead4;
     --cat-5: #60a5fa; --cat-6: #2dd4bf; --cat-7: #bfdbfe; --cat-8: #99f6e4;
   }
@@ -221,13 +234,18 @@ PAGE = Template(r"""<!doctype html>
   .tile { background: var(--surface-1); padding: 16px 18px; border-top: 3px solid var(--accent, transparent);
     transition: transform .15s ease; }
   .tile:hover { transform: translateY(-2px); }
+  .tile:first-child { background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 14%, var(--surface-1)), color-mix(in srgb, var(--accent-2) 10%, var(--surface-1))); }
+  .tile:first-child .tile-value { color: var(--accent); }
   .tile-value { font-size: 26px; font-weight: 600; }
   .tile-label { font-size: 12.5px; color: var(--text-2); margin-top: 2px; }
 
-  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
-    padding: 20px 22px; margin-bottom: 24px; box-shadow: 0 1px 24px rgba(0,0,0,.04); }
-  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-2);
-    margin: 0 0 16px; font-weight: 600; }
+  .card { background: var(--surface-1); border: 1px solid color-mix(in srgb, var(--text-1) 12%, transparent);
+    border-top: 3px solid var(--accent); border-radius: 12px; padding: 20px 22px; margin-bottom: 24px;
+    box-shadow: 0 2px 10px rgba(15,23,42,.07), 0 1px 2px rgba(15,23,42,.05); }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--accent);
+    margin: 0 0 16px; font-weight: 700; }
+  .card:nth-of-type(2) { border-top-color: var(--accent-2); }
+  .card:nth-of-type(2) h2 { color: var(--accent-2); }
   @media (prefers-reduced-motion: no-preference) {
     .tiles, .card { animation: rise .5s ease both; }
     .card:nth-of-type(2) { animation-delay: .05s; }
@@ -239,7 +257,7 @@ PAGE = Template(r"""<!doctype html>
     margin-bottom: 10px; }
   .bar-row:last-child { margin-bottom: 0; }
   .bar-label { font-size: 13px; color: var(--text-2); }
-  .bar-track { background: var(--grid); border-radius: 4px; height: 16px; overflow: hidden; }
+  .bar-track { background: color-mix(in srgb, var(--accent) 8%, var(--grid)); border-radius: 4px; height: 16px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 0 4px 4px 0; min-width: 4px; width: 0;
     transition: width .8s cubic-bezier(.22,1,.36,1); }
   .bar-value { text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; color: var(--text-2); }
@@ -247,14 +265,16 @@ PAGE = Template(r"""<!doctype html>
   .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }
   .toolbar input[type=search] { flex: 1 1 200px; padding: 8px 12px; border-radius: 8px;
     border: 1px solid var(--border); background: var(--plane); color: var(--text-1); font-size: 13px; }
-  .chip { padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--plane);
+  .chip { padding: 5px 12px; border-radius: 999px; border: 1px solid transparent;
+    background: color-mix(in srgb, var(--accent) 8%, var(--plane));
     color: var(--text-2); font-size: 12.5px; cursor: pointer; user-select: none; transition: transform .12s, background .15s, color .15s; }
-  .chip:hover { transform: translateY(-1px); border-color: var(--accent); }
+  .chip:hover { transform: translateY(-1px); background: color-mix(in srgb, var(--accent) 16%, var(--plane)); }
   .chip.active { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-color: transparent; color: #fff; }
 
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  thead tr { background: color-mix(in srgb, var(--accent) 6%, transparent); }
   th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em;
-    color: var(--muted); font-weight: 600; padding: 0 10px 8px; border-bottom: 1px solid var(--grid); }
+    color: var(--text-2); font-weight: 700; padding: 8px 10px; border-bottom: 2px solid var(--accent); }
   th[data-key] { cursor: pointer; user-select: none; }
   th[data-key]:hover { color: var(--text-1); }
   th[data-key]::after { content: ''; display: inline-block; width: 10px; }
@@ -267,6 +287,12 @@ PAGE = Template(r"""<!doctype html>
   .muted { color: var(--muted); }
   .small { font-size: 12px; }
   .detail { max-width: 320px; }
+
+  .shot-link { display: inline-block; margin-right: 6px; border-radius: 6px; overflow: hidden;
+    border: 1px solid var(--border); line-height: 0; transition: transform .12s ease, border-color .12s; }
+  .shot-link:hover { transform: scale(1.06); border-color: var(--accent); }
+  .shot-thumb { width: 44px; height: 44px; object-fit: cover; display: block; background: var(--surface-2); }
+  .shot-text-link { margin-right: 6px; }
 
   .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-1);
     white-space: nowrap; }

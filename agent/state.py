@@ -17,8 +17,10 @@ class State:
                 self.data = {}
 
     def is_done(self, url: str) -> bool:
+        # dry_run is a rehearsal, not a completed attempt - it must never
+        # block a real (live) attempt at the same row from actually running.
         entry = self.data.get(url)
-        return bool(entry) and entry.get("status") not in {None, "", "error"}
+        return bool(entry) and entry.get("status") not in {None, "", "error", "dry_run"}
 
     def get(self, url: str) -> dict | None:
         return self.data.get(url)

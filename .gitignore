@@ -1,5 +1,7 @@
 # Real identities/credentials - never commit
 config.local.yaml
+.env.local
+.flask_secret
 
 # Python
 __pycache__/

@@ -11,8 +11,13 @@ import os
 import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
+from pathlib import Path
 
 from .config import Config
+
+# Referenced from templates/email_body_html.j2 as src="cid:webify_logo_signature".
+LOGO_PATH = Path(__file__).resolve().parent.parent / "templates" / "assets" / "webify-logo-signature.png"
+LOGO_CID = "webify_logo_signature"
 
 
 class Mailer:
@@ -69,6 +74,9 @@ class Mailer:
         msg.set_content(body)
         if html:
             msg.add_alternative(html, subtype="html")
+            if LOGO_PATH.exists() and "cid:" + LOGO_CID in html:
+                html_part = msg.get_payload()[-1]
+                html_part.add_related(LOGO_PATH.read_bytes(), maintype="image", subtype="png", cid=f"<{LOGO_CID}>")
         return msg
 
     def send(self, to_addr: str, subject: str, body: str, html: str, sender: dict) -> tuple[str, str]:
