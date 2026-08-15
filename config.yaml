@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------
+# Outreach agent configuration - PUBLIC TEMPLATE, no real identities.
+#
+# Copy this to config.local.yaml and fill in real values there instead -
+# config.local.yaml is gitignored and, when present, is loaded in place of
+# this file, so your real names/emails/phone numbers never get committed.
+# ---------------------------------------------------------------
+
+run:
+  mode: dry_run            # dry_run = fill forms + render emails but NEVER submit/send
+                           # live    = actually submit forms and send email
+  headless: true
+  max_sites: 0             # 0 = process every row
+  delay_between_sites: [8, 20]   # random pause (seconds) - be polite, avoid rate limits
+  page_timeout_ms: 30000
+  nav_retries: 2
+  resume: true             # skip rows already marked done in output/state.json
+
+# Shared across every sender identity below.
+organization:
+  company: "Your Company Pvt Ltd"
+  website: "https://yourcompany.com"
+  landing_page: "https://yourcompany.com"
+  city: "Your City"
+  state: "Your State"
+  country: "Your Country"
+  pitch: "One line describing what you offer and to whom."
+
+# --- Two separate identity pools ---------------------------------
+#
+# form_senders: whose details get TYPED INTO contact form fields (name,
+# email, phone...). Never used for SMTP - these addresses don't need app
+# passwords. Rotates one per site (row_index % count).
+#
+# email_senders: which Gmail account actually SENDS the fallback email when
+# a site has no usable contact form. Gmail rejects a From address that
+# doesn't match the authenticated account, so each entry needs its own app
+# password (smtp_password_env). Also rotates one per site.
+
+form_senders:
+  - key: person_a
+    first_name: "First"
+    last_name: "Person"
+    email: "person.a@yourcompany.com"
+    phone: "+1 000 000 0000"
+    designation: "Job Title"
+
+email_senders:
+  - key: sales
+    first_name: "First"
+    last_name: "Person"
+    email: "you@gmail.com"
+    phone: "+1 000 000 0000"
+    designation: "Job Title"
+    smtp_password_env: "SMTP_PASSWORD_SALES"
+
+# Optional: personalize the templated messages with a locally-running Ollama model.
+# 100% local - no API key, no cloud call. Requires `ollama serve` running and the
+# model pulled (`ollama pull llama3.1`). If Ollama isn't reachable, the agent just
+# falls back to the plain Jinja2 templates - a run never fails because of this.
+llm:
+  enabled: false                   # true to generate a personalized hook line per company
+  host: "http://localhost:11434"   # local Ollama server
+  model: "llama3.1"                # any model you've pulled locally
+  temperature: 0.4
+  timeout_s: 30
+  max_hook_chars: 220
+  use_site_content: true           # scrape homepage title/meta/h1 as extra context for the hook
+
+form:
+  subject_line: "Partnership enquiry"
+  # Rendered with Jinja2 - same variables as the email template. The agent
+  # detects the message field's maxlength (if the form sets one) and uses
+  # the largest tier that fits; with no maxlength, "full" is used.
+  message_tiers:
+    full: "templates/form_message_full.txt.j2"        # no limit
+    medium: "templates/form_message_medium.txt.j2"     # fits under ~1000 chars
+    short: "templates/form_message_700.txt.j2"         # fits under ~700 chars
+    shortest: "templates/form_message_500.txt.j2"      # fits under ~500 chars
+  skip_if_captcha: true    # if a CAPTCHA is present, don't fight it - fall back to email
+  accept_consent_checkboxes: true
+  max_contact_pages_to_try: 6
+
+email:
+  enabled: true
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  subject_template: "Partnership enquiry"
+  body_template_path: "templates/email_body.txt.j2"
+  html_template_path: ""   # optional, leave blank for plain text only
+  daily_limit: 50          # hard stop - protects your sending reputation
+  per_send_delay: [20, 60]
+
+paths:
+  evidence_dir: "evidence"
+  results_path: "output/results.xlsx"
+  state_path: "output/state.json"
+  log_path: "output/run.log"
+  report_path: "output/report.html"

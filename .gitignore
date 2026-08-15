@@ -1,0 +1,15 @@
+# Real identities/credentials - never commit
+config.local.yaml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Run artifacts - local test data, evidence (screenshots), uploaded sheets
+output/
+evidence/
+uploads/
+
+# OS
+.DS_Store
