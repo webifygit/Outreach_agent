@@ -78,6 +78,8 @@ form:
     medium: "templates/form_message_medium.txt.j2"     # fits under ~1000 chars
     short: "templates/form_message_700.txt.j2"         # fits under ~700 chars
     shortest: "templates/form_message_500.txt.j2"      # fits under ~500 chars
+  require_message: true   # a form with no message box can't carry the pitch -
+                          # send the email instead. false = submit it anyway.
   skip_if_captcha: true    # if a CAPTCHA is present, don't fight it - fall back to email
   accept_consent_checkboxes: true
   max_contact_pages_to_try: 6

@@ -25,7 +25,8 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 from agent import discovery, filler, llm
-from agent.config import Config, default_config_path, jitter
+from agent.config import (Config, default_config_path, identity_placeholders,
+                          jitter, load_env_file, placeholder_advice)
 from agent.evidence import Evidence
 from agent.mailer import Mailer
 from agent.report import build_report
@@ -62,11 +63,15 @@ async def open_page(context, url: str, timeout: int, retries: int):
 
 
 async def locate_form(page, cfg, timeout: int, retries: int, context):
-    """Return (page, forms, contact_url) for the best contact page we can find."""
+    """Return (page, ranked, contact_url) for the best contact page we can find.
+
+    ``ranked`` holds (score, form, frame) triples, best first. The frame is part
+    of the result because a form may live inside an iframe (HubSpot, Jotform,
+    Google Forms...) and every later step has to be scoped to its own document.
+    """
     last_good_url = page.url  # most recent page that actually loaded (status < 400)
     best = (page, [], page.url)  # always a real page, even if no form is ever found
-    forms = await page.evaluate(discovery.EXTRACT_FORMS_JS)
-    ranked = sorted(((discovery.score_form(f), f) for f in forms), key=lambda t: -t[0])
+    ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
     if ranked and ranked[0][0] >= 60:
         return page, ranked, page.url
 
@@ -89,8 +94,7 @@ async def locate_form(page, cfg, timeout: int, retries: int, context):
         except Exception:
             continue
         last_good_url = page.url
-        forms = await page.evaluate(discovery.EXTRACT_FORMS_JS)
-        ranked = sorted(((discovery.score_form(f), f) for f in forms), key=lambda t: -t[0])
+        ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if ranked and ranked[0][0] > best_score:
             best_score, best = ranked[0][0], (page, ranked, page.url)
         if best_score >= 60:
@@ -108,6 +112,12 @@ async def locate_form(page, cfg, timeout: int, retries: int, context):
             pass
         best = (page, best[1], last_good_url)
     return best
+
+
+def _embed_label(form: dict) -> str:
+    """Host of the iframe a form came from - "hsforms.net", "jotform.com", ..."""
+    host = urlparse(form.get("frame_url", "")).netloc
+    return host or "same-origin iframe"
 
 
 async def process(row, context, cfg, env, mailer, ev, args, logfile):
@@ -144,17 +154,28 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile):
     page, ranked, contact_url = await locate_form(page, cfg, timeout, retries, context)
     result["contact_page"] = contact_url
 
-    top_score, top_form = (ranked[0] if ranked else (-999, None))
-    captcha = await discovery.has_captcha(page)
+    top_score, top_form, top_frame = (ranked[0] if ranked else (-999, None, None))
+    captcha = await discovery.has_captcha(page, top_frame)
 
     use_form = top_form is not None and top_score >= 40
     if use_form and captcha and cfg.path("form", "skip_if_captcha", default=True):
         use_form = False
         result["detail"] = f"CAPTCHA present ({captcha}) - falling back to email. "
 
+    # A form with nowhere to put the message can only deliver a name and an
+    # email address - the recipient gets an enquiry that says nothing. The
+    # email fallback carries the full pitch, so prefer it. Set
+    # form.require_message: false to submit such forms anyway.
+    if use_form and cfg.path("form", "require_message", default=True):
+        if "message" not in filler.classify(top_form["fields"]):
+            use_form = False
+            result["detail"] += "form has no message field (pitch could not be included) - falling back to email. "
+
     if use_form:
         result["method"] = "form"
-        report = await filler.fill_form(page, top_form, cfg, ctx, env, subject)
+        if top_form.get("in_iframe"):
+            result["detail"] += f"embedded form in iframe ({_embed_label(top_form)}). "
+        report = await filler.fill_form(top_frame, top_form, cfg, ctx, env, subject)
         result["screenshot_before"] = await ev.shot(page, idx, url, "01_filled")
 
         if report["missing_required"]:
@@ -167,8 +188,10 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile):
             return result
 
         before_url = page.url
-        click = await filler.submit_form(page, top_form["form_key"], timeout)
-        status, detail = await filler.verify_submission(page, before_url, top_form["form_key"])
+        click = await filler.submit_form(top_frame, top_form["form_key"], timeout)
+        status, detail = await filler.verify_submission(
+            page, top_frame, before_url, top_form["form_key"]
+        )
         result["screenshot_after"] = await ev.shot(page, idx, url, "02_after_submit")
         result["status"] = status
         result["detail"] += f"{click}; {detail}"
@@ -218,6 +241,7 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile):
 
 
 async def main_async(args) -> int:
+    load_env_file(Path(__file__).resolve().parent)
     cfg = Config.load(args.config)
     if args.live:
         cfg["run"]["mode"] = "live"
@@ -226,6 +250,19 @@ async def main_async(args) -> int:
 
     logfile = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log"))
     logfile.parent.mkdir(parents=True, exist_ok=True)
+
+    placeholders = identity_placeholders(cfg)
+    if placeholders:
+        log("-" * 72, logfile)
+        log(f"CONFIG: {len(placeholders)} placeholder identity value(s) still in "
+            f"{Path(args.config).name} - these get typed into real contact forms:", logfile)
+        for item in placeholders[:14]:
+            log(f"    {item}", logfile)
+        log(placeholder_advice(args.config), logfile)
+        log("-" * 72, logfile)
+        if cfg.live:
+            log("REFUSING to send live with a placeholder identity. Nothing was sent.", logfile)
+            return 2
 
     rows, skipped_rows = load_rows(args.input)
     if skipped_rows:

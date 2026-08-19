@@ -28,11 +28,13 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 from werkzeug.utils import secure_filename
 
-from agent.config import Config, default_config_path
+from agent.config import Config, default_config_path, load_env_file
 
 ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = ROOT / "uploads"
 ALLOWED_EXT = {".xlsx", ".xls", ".csv", ".tsv"}
+
+load_env_file(ROOT)  # before anything below reads the environment
 
 AGENT_HOST = os.environ.get("AGENT_HOST", "127.0.0.1")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "5000"))
@@ -125,10 +127,29 @@ def _run_report_url() -> str:
     return f"/files/{rel}"
 
 
+def _last_problem() -> str:
+    """The run's own explanation of why it stopped, for the status pill.
+
+    A refused run exits before writing any report, so without this the UI can
+    only say "exit 2" and the reason sits unread in a log file.
+    """
+    try:
+        tail = LAUNCH_LOG.read_text(encoding="utf-8", errors="replace")[-6000:]
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        for marker in ("REFUSING", "CONFIG:", "WARNING"):
+            if marker in line:
+                return line.split("] ", 1)[-1].strip()[:200]
+    return ""
+
+
 def _status() -> dict:
     proc = STATE["proc"]
     running = proc is not None and proc.poll() is None
+    code = None if proc is None else proc.poll()
     return {
+        "problem": _last_problem() if (code not in (0, None)) else "",
         "running": running,
         "returncode": None if proc is None else proc.poll(),
         "input": STATE["input"],
@@ -565,7 +586,10 @@ INDEX_HTML = r"""<!doctype html>
       stopBtn.hidden = true;
       startBtn.disabled = !uploadedPath;
       if (s.returncode === 0) setPill('done', 'Finished');
-      else if (s.returncode) setPill('error', 'Stopped (exit ' + s.returncode + ')');
+      else if (s.returncode) {
+        setPill('error', s.problem || ('Stopped (exit ' + s.returncode + ')'));
+        pill.title = s.problem || '';
+      }
       else setPill('', 'Idle');
       if (poller) { clearInterval(poller); poller = null; }
     }

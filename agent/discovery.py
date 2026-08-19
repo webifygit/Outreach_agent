@@ -1,4 +1,9 @@
-"""Find the contact page, the form on it, and any published email address."""
+"""Find the contact page, the form on it, and any published email address.
+
+Forms are looked for in the main document *and* in every iframe on the page,
+so third-party embeds (HubSpot, Jotform, Google Forms, ...) are filled like
+any other form instead of falling through to the email path.
+"""
 from __future__ import annotations
 
 import re
@@ -33,6 +38,32 @@ CAPTCHA_SELECTORS = [
     ".cf-turnstile",
     "[data-sitekey]",
 ]
+
+# A frame whose URL matches this is a hosted form embed. Such a form is a real
+# contact form even when its markup is generic, so it gets a scoring nudge.
+EMBED_HOST_RE = re.compile(
+    r"hsforms|hubspot|jotform|formstack|wufoo|cognitoforms|tally\.so|fillout\.com|"
+    r"paperform|zohopublic|forms\.zoho|docs\.google\.com/forms|forms\.office\.com|"
+    r"formsubmit|getform|formspree|gravityforms|typeform|pardot|marketo|activehosted",
+    re.I,
+)
+
+# Frames that never hold a contact form - skipped so a page stuffed with ad and
+# analytics iframes doesn't cost a DOM scan each.
+SKIP_FRAME_RE = re.compile(
+    r"googletagmanager|googlesyndication|googleadservices|doubleclick|adsbygoogle|"
+    r"google-analytics|facebook\.com/(tr|plugins)|connect\.facebook|youtube\.com/embed|"
+    r"youtube-nocookie|player\.vimeo|platform\.twitter|/gtm\.|hotjar|intercom|"
+    r"gstatic\.com|recaptcha|hcaptcha|challenges\.cloudflare",
+    re.I,
+)
+
+# Same idea for CAPTCHAs: they live in their own iframe, so the frame URL is
+# the most reliable tell - the parent DOM selectors can miss a late injection.
+CAPTCHA_URL_RE = re.compile(r"recaptcha|hcaptcha|challenges\.cloudflare|turnstile", re.I)
+
+# A page with hundreds of frames is pathological; cap the scan.
+MAX_FRAMES_SCANNED = 15
 
 # JS that tags every candidate field with data-agent-id and returns a description
 # of each form on the page. Running one script beats dozens of round trips.
@@ -153,17 +184,119 @@ def score_form(form: dict) -> int:
     score += min(len(fields), 6) * 3
     if re.search(r"newsletter|subscribe|login|sign.?in|search", form["desc"]):
         score -= 30
+    if EMBED_HOST_RE.search(form.get("frame_url", "")):
+        # A form served by HubSpot/Jotform/etc is there to be filled in. Their
+        # markup is generic (field names like "0-1/email"), which the keyword
+        # rules above under-score, so give the provider itself some weight.
+        score += 30
     return score
 
 
-async def has_captcha(page) -> str:
-    for sel in CAPTCHA_SELECTORS:
-        try:
-            if await page.locator(sel).count() > 0:
-                return sel
-        except Exception:
-            continue
+async def has_captcha(page, frame=None) -> str:
+    """Detect a CAPTCHA guarding the page, or the frame the form lives in.
+
+    Checked two ways because either alone misses cases: the DOM selectors catch
+    a widget the page renders itself, and the frame URLs catch one injected
+    later (or one inside a third-party form embed, invisible to the parent DOM).
+    """
+    targets = [page]
+    if frame is not None and frame not in targets:
+        targets.append(frame)
+
+    for target in targets:
+        for sel in CAPTCHA_SELECTORS:
+            try:
+                if await target.locator(sel).count() > 0:
+                    return sel
+            except Exception:
+                continue
+
+    try:
+        for f in page.frames:
+            if CAPTCHA_URL_RE.search(f.url or ""):
+                return f"frame:{CAPTCHA_URL_RE.search(f.url).group(0)}"
+    except Exception:
+        pass
     return ""
+
+
+async def extract_forms(target) -> list[dict]:
+    """Run the extractor against one Page or Frame. Never raises."""
+    try:
+        return await target.evaluate(EXTRACT_FORMS_JS) or []
+    except Exception:
+        # Cross-origin frame still navigating, detached mid-scan, or a frame
+        # that refuses script evaluation - not fatal, just nothing to score.
+        return []
+
+
+def _worth_scanning(frame, is_main: bool) -> bool:
+    url = frame.url or ""
+    if is_main:
+        return True
+    if SKIP_FRAME_RE.search(url):
+        return False
+    try:
+        if frame.is_detached():
+            return False
+    except Exception:
+        return False
+    return True
+
+
+async def scan_frames(page, limit: int = MAX_FRAMES_SCANNED) -> list[tuple]:
+    """Every form on the page, main document and iframes alike.
+
+    Returns (frame, form) pairs - the frame is carried along because filling,
+    submitting and verifying all have to be scoped to the document that owns
+    the form. Playwright locators do not cross a frame boundary.
+    """
+    pairs: list[tuple] = []
+    try:
+        frames = list(page.frames)[:limit]
+    except Exception:
+        frames = [page.main_frame]
+
+    for frame in frames:
+        is_main = frame is page.main_frame
+        if not _worth_scanning(frame, is_main):
+            continue
+        for form in await extract_forms(frame):
+            form["in_iframe"] = not is_main
+            form["frame_url"] = "" if is_main else (frame.url or "")
+            pairs.append((frame, form))
+    return pairs
+
+
+def _embed_frame_present(page) -> bool:
+    try:
+        return any(EMBED_HOST_RE.search(f.url or "") for f in page.frames)
+    except Exception:
+        return False
+
+
+async def forms_everywhere(page, settle_ms: int = 3000) -> list[tuple]:
+    """scan_frames, with one grace period for a slow-booting form embed.
+
+    Hosted embeds mount their form after the parent page has already fired
+    domcontentloaded, so a first scan can legitimately find nothing inside an
+    iframe that is about to contain the only contact form on the site.
+    """
+    pairs = await scan_frames(page)
+    if not any(form["in_iframe"] for _, form in pairs) and _embed_frame_present(page):
+        try:
+            await page.wait_for_timeout(settle_ms)
+        except Exception:
+            return pairs
+        pairs = await scan_frames(page)
+    return pairs
+
+
+def rank_forms(pairs: list[tuple]) -> list[tuple]:
+    """(score, form, frame), best first."""
+    ranked = [(score_form(form), form, frame) for frame, form in pairs]
+    ranked.sort(key=lambda t: -t[0])
+    return ranked
 
 
 async def collect_emails(page, site_host: str) -> list[str]:

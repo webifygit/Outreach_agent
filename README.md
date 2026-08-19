@@ -103,6 +103,10 @@ the last full word inside the limit. Tune the mapping in `config.yaml` under
   and a `.txt` copy of every email body sent
 - `output/state.json` - progress; a re-run resumes and skips completed rows
 
+A run refuses to start in live mode while `config.yaml`'s placeholder identity
+is still in place, and warns about it on every dry run - filling real contact
+forms as "First Person" from "Your Company Pvt Ltd" is worse than not running.
+
 ### Status values
 
 | status | meaning |
@@ -117,7 +121,10 @@ the last full word inside the limit. Tune the mapping in `config.yaml` under
 
 ## How form detection works
 
-1. Load the homepage, score every `<form>` on it.
+1. Load the homepage, score every `<form>` on it - in the main document **and
+   inside every iframe**, so third-party embeds (HubSpot, Jotform, Google Forms,
+   Formstack, ...) are found like any other form. Ad and analytics iframes are
+   skipped, and a hosted form provider adds to the score.
 2. If nothing scores well, follow links matching *contact / get in touch /
    enquiry*, then try `/contact`, `/contact-us`, etc.
 3. Scoring rejects search boxes, login forms, and single-field newsletter signups.
@@ -126,6 +133,9 @@ the last full word inside the limit. Tune the mapping in `config.yaml` under
 5. **Hidden fields are never filled** - most are honeypots, and filling one is the
    fastest way to be silently classified as a bot.
 6. Required consent checkboxes are ticked; marketing opt-ins are not.
+7. Filling, submitting and confirmation-reading are all scoped to the document
+   that owns the form, so an embedded form's "thanks, we got it" - which renders
+   inside the iframe and never appears in the parent page's text - is still read.
 
 ## Local LLM personalization (optional, no API key)
 
@@ -164,8 +174,14 @@ Jotform), the page is behind Cloudflare, or the fields are unlabelled.
 
 - **CAPTCHA-protected forms are skipped by design.** The agent falls back to
   email rather than trying to defeat the check.
-- **iframe-embedded forms** (HubSpot/Typeform/Jotform) are not filled by the
-  current extractor - it only reads the main frame. If many of your targets use
-  these, extend `locate_form` to loop over `page.frames`.
+- **Forms with no message box are skipped too** (`form.require_message`, on by
+  default). They can only carry a name and an address, which delivers nothing -
+  the email fallback sends the full pitch instead.
+- **Forms hidden until a click** (inside a modal, tab or accordion) are not
+  filled - the extractor only considers fields that are visible when the page
+  settles, and an unopened form has none. `wpforms.com/contact/` is an example.
+- **Typeform-style one-question-at-a-time embeds** are found but not usefully
+  filled: there is no single form to complete, only a wizard that reveals the
+  next question after each answer.
 - `uncertain` is a real and common outcome. Some sites give no confirmation at
   all. Sample the screenshots rather than trusting the count.

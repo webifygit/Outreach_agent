@@ -1,4 +1,10 @@
-"""Map form fields to roles, fill them, submit, and verify the result."""
+"""Map form fields to roles, fill them, submit, and verify the result.
+
+Everything here takes the *frame* that owns the form rather than the page.
+For a form in the main document that frame is ``page.main_frame``; for an
+embedded one it is the iframe's frame. Playwright locators never cross a
+frame boundary, so scoping to the owner is what makes both cases identical.
+"""
 from __future__ import annotations
 
 import re
@@ -143,12 +149,25 @@ def values_for(cfg, ctx: dict, message: str, subject: str) -> dict[str, str]:
     }
 
 
-async def fill_form(page, form: dict, cfg, ctx: dict, env, subject: str) -> dict:
-    """Fill every mapped field. Returns a report of what was written."""
+async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dict:
+    """Fill every mapped field. Returns a report of what was written.
+
+    ``frame`` is the document that owns the form (page.main_frame, or the
+    iframe's frame for an embedded form).
+    """
     roles = classify(form["fields"])
     msg_field = roles.get("message")
     message = render_tiered_message(env, cfg, ctx, msg_field.get("maxlength") if msg_field else None)
     values = values_for(cfg, ctx, message, subject)
+
+    # A form with a first-name field and no last-name field is almost always
+    # asking for the whole name - an input called "firstname" whose label reads
+    # "What's your name?" is a common pattern. Filling only "Irshad" there sends
+    # a nameless-looking enquiry, so use the full name when nothing else on the
+    # form can carry the surname.
+    if "first_name" in roles and "last_name" not in roles and "name" not in roles:
+        values["first_name"] = values["name"] or values["first_name"]
+
     filled: dict[str, str] = {}
     missing_required: list[str] = []
 
@@ -159,10 +178,10 @@ async def fill_form(page, form: dict, cfg, ctx: dict, env, subject: str) -> dict
         sel = f"[data-agent-id='{field['agent_id']}']"
         try:
             if field["tag"] == "select":
-                await _select_best(page, sel, field, role, value)
+                await _select_best(frame, sel, field, role, value)
                 filled[role] = "(select)"
             else:
-                await page.fill(sel, value, timeout=5000)
+                await frame.fill(sel, value, timeout=5000)
                 filled[role] = value[:60]
         except Exception as exc:  # noqa: BLE001
             filled[role] = f"FAILED: {type(exc).__name__}"
@@ -176,7 +195,7 @@ async def fill_form(page, form: dict, cfg, ctx: dict, env, subject: str) -> dict
         try:
             opts = [o for o in field["options"] if o["value"] and o["value"] not in {"0", "-1"}]
             if opts:
-                await page.select_option(
+                await frame.select_option(
                     f"[data-agent-id='{field['agent_id']}']", value=opts[0]["value"], timeout=5000
                 )
         except Exception:
@@ -191,7 +210,7 @@ async def fill_form(page, form: dict, cfg, ctx: dict, env, subject: str) -> dict
                 continue
             if field["required"] or CONSENT_RE.search(field["desc"]):
                 try:
-                    await page.check(f"[data-agent-id='{field['agent_id']}']", timeout=4000)
+                    await frame.check(f"[data-agent-id='{field['agent_id']}']", timeout=4000)
                 except Exception:
                     pass
 
@@ -203,7 +222,7 @@ async def fill_form(page, form: dict, cfg, ctx: dict, env, subject: str) -> dict
     return {"filled": filled, "roles": list(roles), "missing_required": missing_required}
 
 
-async def _select_best(page, sel, field, role, value):
+async def _select_best(frame, sel, field, role, value):
     """Choose the option whose text best matches, else the first real option."""
     opts = [o for o in field["options"] if o["value"]]
     if not opts:
@@ -211,18 +230,18 @@ async def _select_best(page, sel, field, role, value):
     target = value.lower()
     for o in opts:
         if target and target in (o["text"] or "").lower():
-            await page.select_option(sel, value=o["value"], timeout=5000)
+            await frame.select_option(sel, value=o["value"], timeout=5000)
             return
     real = [o for o in opts if o["value"] not in {"0", "-1", ""}]
-    await page.select_option(sel, value=(real or opts)[0]["value"], timeout=5000)
+    await frame.select_option(sel, value=(real or opts)[0]["value"], timeout=5000)
 
 
-async def submit_form(page, form_key: str, timeout_ms: int) -> str:
+async def submit_form(frame, form_key: str, timeout_ms: int) -> str:
     """Click the submit control. Returns a short description of what was clicked."""
     scope = f"form[data-agent-form='{form_key}']"
     for sel in SUBMIT_SELECTORS:
         try:
-            loc = page.locator(f"{scope} {sel}").first
+            loc = frame.locator(f"{scope} {sel}").first
             if await loc.count() == 0 or not await loc.is_visible():
                 continue
             label = (await loc.inner_text() or "").strip()[:40]
@@ -232,16 +251,28 @@ async def submit_form(page, form_key: str, timeout_ms: int) -> str:
             continue
     # Last resort: submit the form element itself.
     try:
-        await page.eval_on_selector(scope, "f => f.requestSubmit ? f.requestSubmit() : f.submit()")
+        await frame.eval_on_selector(scope, "f => f.requestSubmit ? f.requestSubmit() : f.submit()")
         return "requestSubmit()"
     except Exception as exc:  # noqa: BLE001
         return f"no_submit_control:{type(exc).__name__}"
 
 
-async def verify_submission(page, before_url: str, form_key: str) -> tuple[str, str]:
+async def _read_body(target) -> str:
+    """body text of a page or frame; "" if it is gone or unreadable."""
+    try:
+        return (await target.inner_text("body"))[:8000]
+    except Exception:
+        return ""
+
+
+async def verify_submission(page, frame, before_url: str, form_key: str) -> tuple[str, str]:
     """Best-effort read of whether the submission landed.
 
     Returns (status, detail) where status is success | uncertain | failed.
+
+    An embedded form renders its "thanks, we got it" inside the iframe, and the
+    parent page's body text does not include it - so the frame is read first and
+    the page second, and either one carrying a confirmation counts.
     """
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
@@ -250,10 +281,13 @@ async def verify_submission(page, before_url: str, form_key: str) -> tuple[str, 
     await page.wait_for_timeout(2500)
 
     after_url = page.url
-    try:
-        body = (await page.inner_text("body"))[:8000]
-    except Exception:
-        body = ""
+    body = ""
+    if frame is not None and frame is not page.main_frame:
+        # Submitting can detach and replace the embed's frame; that on its own
+        # is a decent success signal, but only alongside the text checks below.
+        body = await _read_body(frame)
+    page_body = await _read_body(page)
+    body = (body + chr(10) + page_body).strip() if body else page_body
 
     if after_url != before_url and re.search(r"thank|success|sent|submitted", after_url, re.I):
         return "success", f"redirected to {after_url}"
@@ -268,12 +302,19 @@ async def verify_submission(page, before_url: str, form_key: str) -> tuple[str, 
         snippet = body[max(0, match.start() - 60): match.end() + 60].replace("\n", " ")
         return "failed", f"validation error: {snippet.strip()[:140]}"
 
+    scope = frame if frame is not None else page
     try:
-        gone = await page.locator(f"form[data-agent-form='{form_key}']").count() == 0
-        if gone:
+        if await scope.locator(f"form[data-agent-form='{form_key}']").count() == 0:
             return "success", "form removed from page after submit"
     except Exception:
-        pass
+        # Reading a detached frame throws - the embed tore its form down, which
+        # is what a hosted form does once it has accepted the submission.
+        if frame is not None and frame is not page.main_frame:
+            try:
+                if frame.is_detached():
+                    return "success", "form iframe replaced after submit"
+            except Exception:
+                pass
 
     if after_url != before_url:
         return "uncertain", f"navigated to {after_url}, no confirmation text found"
