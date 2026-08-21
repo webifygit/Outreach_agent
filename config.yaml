@@ -13,6 +13,8 @@ run:
   max_sites: 0             # 0 = process every row
   delay_between_sites: [8, 20]   # random pause (seconds) - be polite, avoid rate limits
   page_timeout_ms: 30000
+  site_timeout_s: 180     # hard ceiling per site - a page that wedges the
+                          # extractor is recorded as 'timeout' and skipped
   nav_retries: 2
   resume: true             # skip rows already marked done in output/state.json
 

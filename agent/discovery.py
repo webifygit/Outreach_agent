@@ -6,6 +6,7 @@ any other form instead of falling through to the email path.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -64,6 +65,12 @@ CAPTCHA_URL_RE = re.compile(r"recaptcha|hcaptcha|challenges\.cloudflare|turnstil
 
 # A page with hundreds of frames is pathological; cap the scan.
 MAX_FRAMES_SCANNED = 15
+
+# page.evaluate() has NO timeout in Playwright - the browser's default timeout
+# does not apply to it. A page whose main thread is blocked (heavy corporate
+# sites, a script in a busy loop) therefore hangs the extractor forever, and
+# with it the whole batch. Every evaluate below is bounded by this instead.
+EVAL_TIMEOUT_S = 15.0
 
 # JS that tags every candidate field with data-agent-id and returns a description
 # of each form on the page. Running one script beats dozens of round trips.
@@ -221,12 +228,15 @@ async def has_captcha(page, frame=None) -> str:
 
 
 async def extract_forms(target) -> list[dict]:
-    """Run the extractor against one Page or Frame. Never raises."""
+    """Run the extractor against one Page or Frame. Never raises, never hangs."""
     try:
-        return await target.evaluate(EXTRACT_FORMS_JS) or []
+        return await asyncio.wait_for(
+            target.evaluate(EXTRACT_FORMS_JS), timeout=EVAL_TIMEOUT_S
+        ) or []
     except Exception:
-        # Cross-origin frame still navigating, detached mid-scan, or a frame
-        # that refuses script evaluation - not fatal, just nothing to score.
+        # Timed out, or: cross-origin frame still navigating, detached
+        # mid-scan, a frame that refuses script evaluation - not fatal, just
+        # nothing to score.
         return []
 
 
@@ -303,9 +313,10 @@ async def collect_emails(page, site_host: str) -> list[str]:
     """Prefer mailto: links, then anything in the raw HTML. Same-domain first."""
     found: list[str] = []
     try:
-        hrefs = await page.eval_on_selector_all(
-            "a[href^='mailto:']", "els => els.map(e => e.getAttribute('href'))"
-        )
+        hrefs = await asyncio.wait_for(
+            page.eval_on_selector_all(
+                "a[href^='mailto:']", "els => els.map(e => e.getAttribute('href'))"),
+            timeout=EVAL_TIMEOUT_S)
         for h in hrefs or []:
             addr = h.replace("mailto:", "").split("?")[0].strip()
             if addr and EMAIL_RE.fullmatch(addr):
@@ -313,7 +324,7 @@ async def collect_emails(page, site_host: str) -> list[str]:
     except Exception:
         pass
     try:
-        html = await page.content()
+        html = await asyncio.wait_for(page.content(), timeout=EVAL_TIMEOUT_S)
         found.extend(EMAIL_RE.findall(html))
     except Exception:
         pass
@@ -334,10 +345,11 @@ async def collect_emails(page, site_host: str) -> list[str]:
 async def find_contact_links(page, base_url: str, limit: int) -> list[str]:
     """Links on the current page whose text or href smells like a contact page."""
     try:
-        anchors = await page.eval_on_selector_all(
-            "a[href]",
-            "els => els.map(e => ({href: e.getAttribute('href'), text: (e.innerText||'').trim()}))",
-        )
+        anchors = await asyncio.wait_for(
+            page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(e => ({href: e.getAttribute('href'), text: (e.innerText||'').trim()}))"),
+            timeout=EVAL_TIMEOUT_S)
     except Exception:
         return []
 
@@ -367,7 +379,7 @@ async def find_contact_links(page, base_url: str, limit: int) -> list[str]:
 async def page_summary(page, max_chars: int = 500) -> str:
     """Title + meta description + first heading - context for the local LLM hook."""
     try:
-        data = await page.evaluate(
+        data = await asyncio.wait_for(page.evaluate(
             """() => {
                 const meta = (name) => document.querySelector(`meta[name="${name}"]`)?.content
                     || document.querySelector(`meta[property="og:${name}"]`)?.content || '';
@@ -375,7 +387,7 @@ async def page_summary(page, max_chars: int = 500) -> str:
                     document.querySelector('h1')?.innerText || ''];
                 return bits.filter(Boolean).join(' | ');
             }"""
-        )
+        ), timeout=EVAL_TIMEOUT_S)
     except Exception:
         return ""
     return " ".join((data or "").split())[:max_chars]

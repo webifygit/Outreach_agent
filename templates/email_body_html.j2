@@ -1,11 +1,11 @@
 <div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #1f2937; line-height: 1.6; max-width: 600px;">
-  <p>Hi {{ contact_first_name or (company_name ~ " team") }},</p>
+  <p>Hi <strong>{{ contact_first_name or (company_name ~ " team") }}</strong>,</p>
 
-  <p>I came across {{ website }} and wanted to reach out directly.</p>
+  <p>I came across your business and wanted to reach out directly.</p>
 
-  <p>At {{ sender.company }}, we help businesses improve their online presence and customer engagement through modern digital and AI-powered solutions. Whether you're looking to redesign your website, improve performance, or automate customer interactions, we can help.</p>
+  <p>At <strong>{{ sender.company }}</strong>, we help businesses improve their online presence and customer engagement through modern digital and AI-powered solutions. Whether you're looking to redesign your website, improve performance, or automate customer interactions, we can help.</p>
 
-  <p>Our services include:</p>
+  <p><strong>Our services include:</strong></p>
   <ul style="margin: 0 0 16px; padding-left: 20px;">
     <li>Website Design &amp; Redesign</li>
     <li>Website Support &amp; Maintenance</li>
@@ -18,7 +18,7 @@
 
   <p>{{ ai_hook or "Our focus is on helping businesses generate more leads, improve customer experience, and stay competitive as more customers discover businesses through AI platforms like ChatGPT and other large language models." }}</p>
 
-  <p>You can learn more about us at: <a href="{{ sender.landing_page or sender.website }}" style="color:#2563eb;">{{ sender.landing_page or sender.website }}</a></p>
+  <p><strong>You can learn more about us at: <a href="{{ sender.landing_page or sender.website }}" style="color:#2563eb;">{{ sender.landing_page or sender.website }}</a></strong></p>
 
   <p>If you're considering upgrading your digital presence or exploring how AI can benefit your business, I'd be happy to arrange a quick, no-obligation discussion to understand your goals and share some ideas.</p>
 

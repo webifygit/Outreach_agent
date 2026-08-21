@@ -297,6 +297,7 @@ async def main_async(args) -> int:
 
     results: list[dict] = []
     daily_cap = int(cfg.path("email", "daily_limit", default=50))
+    site_timeout = float(cfg.path("run", "site_timeout_s", default=180))
     today = datetime.now().date().isoformat()
     report_path = cfg.resolve(cfg.path("paths", "report_path", default="output/report.html"))
     report_mode = "live" if cfg.live else "dry_run"
@@ -315,7 +316,29 @@ async def main_async(args) -> int:
                 break
             log(f"[{n}/{len(rows)}] {row['website']}", logfile)
             try:
-                res = await process(row, context, cfg, env, mailer, ev, args, logfile)
+                # No single site may hold up the batch. Bounded work can still
+                # add up past this (nav retries x contact-page candidates), and
+                # a wedged page can block in ways the browser timeout does not
+                # cover, so the whole per-site pipeline gets one ceiling.
+                res = await asyncio.wait_for(
+                    process(row, context, cfg, env, mailer, ev, args, logfile),
+                    timeout=site_timeout,
+                )
+            except asyncio.TimeoutError:
+                res = {
+                    "row_index": row["row_index"], "website": row["website"],
+                    "company_name": row["company_name"], "method": "none",
+                    "status": "timeout",
+                    "detail": f"site exceeded run.site_timeout_s ({site_timeout:.0f}s) - skipped",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                # process() owns a page it never got to close; drop any left
+                # behind or they accumulate across a long batch.
+                for stray in list(context.pages):
+                    try:
+                        await stray.close()
+                    except Exception:
+                        pass
             except Exception as exc:  # noqa: BLE001
                 res = {
                     "row_index": row["row_index"], "website": row["website"],
