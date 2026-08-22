@@ -114,6 +114,50 @@ async def locate_form(page, cfg, timeout: int, retries: int, context):
     return best
 
 
+async def open_browser(pw, cfg, old_browser=None):
+    """Launch a fresh browser + context, discarding any previous one.
+
+    Chromium can die mid-batch (it did, after ~90 sites on a 118-site run:
+    "Connection closed while reading from the driver"). Every later
+    context.new_page() then throws, so without this the run marches on
+    recording failures for sites it never actually visited.
+    """
+    if old_browser is not None:
+        try:
+            await old_browser.close()
+        except Exception:
+            pass
+    browser = await pw.chromium.launch(headless=bool(cfg.path("run", "headless", default=True)))
+    context = await browser.new_context(
+        user_agent=UA, viewport={"width": 1440, "height": 960},
+        locale="en-US", ignore_https_errors=True,
+    )
+    context.set_default_timeout(int(cfg.path("run", "page_timeout_ms", default=30000)))
+    return browser, context
+
+
+def _row_result(row, status: str, detail: str, method: str = "none") -> dict:
+    return {
+        "row_index": row["row_index"], "website": row["website"],
+        "company_name": row["company_name"], "method": method,
+        "status": status, "detail": detail,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+async def _close_stray_pages(context) -> None:
+    """process() owns a page it may not have closed; drop leftovers."""
+    try:
+        pages = list(context.pages)
+    except Exception:
+        return
+    for page in pages:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
 def _embed_label(form: dict) -> str:
     """Host of the iframe a form came from - "hsforms.net", "jotform.com", ..."""
     host = urlparse(form.get("frame_url", "")).netloc
@@ -303,58 +347,84 @@ async def main_async(args) -> int:
     report_mode = "live" if cfg.live else "dry_run"
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=bool(cfg.path("run", "headless", default=True)))
-        context = await browser.new_context(
-            user_agent=UA, viewport={"width": 1440, "height": 960},
-            locale="en-US", ignore_https_errors=True,
-        )
-        context.set_default_timeout(int(cfg.path("run", "page_timeout_ms", default=30000)))
+        browser, context = await open_browser(pw, cfg)
+        recycle_every = int(cfg.path("run", "recycle_browser_every", default=50))
+        max_consecutive = int(cfg.path("run", "max_consecutive_errors", default=6))
+        consecutive_errors = 0
+        since_recycle = 0
 
         for n, row in enumerate(rows, 1):
             if state.sent_today(today) >= daily_cap:
                 log(f"daily email cap ({daily_cap}) reached - stopping", logfile)
                 break
+
+            # Long batches leak browser memory until Chromium falls over, so
+            # retire it on a schedule rather than waiting for the crash.
+            if recycle_every and since_recycle >= recycle_every:
+                log(f"recycling browser after {since_recycle} sites", logfile)
+                browser, context = await open_browser(pw, cfg, browser)
+                since_recycle = 0
+
             log(f"[{n}/{len(rows)}] {row['website']}", logfile)
-            try:
-                # No single site may hold up the batch. Bounded work can still
-                # add up past this (nav retries x contact-page candidates), and
-                # a wedged page can block in ways the browser timeout does not
-                # cover, so the whole per-site pipeline gets one ceiling.
-                res = await asyncio.wait_for(
-                    process(row, context, cfg, env, mailer, ev, args, logfile),
-                    timeout=site_timeout,
-                )
-            except asyncio.TimeoutError:
-                res = {
-                    "row_index": row["row_index"], "website": row["website"],
-                    "company_name": row["company_name"], "method": "none",
-                    "status": "timeout",
-                    "detail": f"site exceeded run.site_timeout_s ({site_timeout:.0f}s) - skipped",
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                }
-                # process() owns a page it never got to close; drop any left
-                # behind or they accumulate across a long batch.
-                for stray in list(context.pages):
-                    try:
-                        await stray.close()
-                    except Exception:
-                        pass
-            except Exception as exc:  # noqa: BLE001
-                res = {
-                    "row_index": row["row_index"], "website": row["website"],
-                    "company_name": row["company_name"], "method": "none",
-                    "status": "error", "detail": f"{type(exc).__name__}: {str(exc)[:200]}",
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                }
+            res = None
+            for attempt in (1, 2):
+                if not browser.is_connected():
+                    log("    browser is not connected - relaunching", logfile)
+                    browser, context = await open_browser(pw, cfg, browser)
+                try:
+                    # No single site may hold up the batch. Bounded work can
+                    # still add up past this (nav retries x contact-page
+                    # candidates), and a wedged page can block in ways the
+                    # browser timeout does not cover, so the whole per-site
+                    # pipeline gets one ceiling.
+                    res = await asyncio.wait_for(
+                        process(row, context, cfg, env, mailer, ev, args, logfile),
+                        timeout=site_timeout,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    res = _row_result(row, "timeout",
+                                      f"site exceeded run.site_timeout_s ({site_timeout:.0f}s) - skipped")
+                    await _close_stray_pages(context)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    # A dead browser is worth one relaunch and one retry - the
+                    # site itself was never really attempted. Anything else is
+                    # this site's own failure.
+                    if attempt == 1 and not browser.is_connected():
+                        log(f"    browser died ({type(exc).__name__}) - relaunching, retrying this site",
+                            logfile)
+                        browser, context = await open_browser(pw, cfg, browser)
+                        since_recycle = 0
+                        continue
+                    res = _row_result(row, "error", f"{type(exc).__name__}: {str(exc)[:200]}")
+                    break
+
             results.append(res)
             state.record(row["website"], res)
+            since_recycle += 1
             log(f"    -> {res['method'] or '-'} / {res['status']} :: {res['detail'][:110]}", logfile)
             build_report(list(state.data.values()), report_mode, report_path)
+
+            # Burning through the rest of the sheet recording failures is worse
+            # than stopping: the rows look attempted when they never were.
+            consecutive_errors = consecutive_errors + 1 if res["status"] == "error" else 0
+            if max_consecutive and consecutive_errors >= max_consecutive:
+                log(f"stopping - {consecutive_errors} sites failed in a row, something is wrong. "
+                    f"Remaining rows left untouched so a re-run can retry them.", logfile)
+                break
+
             if n < len(rows):
                 await asyncio.sleep(jitter(cfg.path("run", "delay_between_sites"), (8, 20)))
 
-        await context.close()
-        await browser.close()
+        try:
+            await context.close()
+        except Exception:
+            pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
     mailer.close()
     out = write_results(results, cfg.resolve(cfg.path("paths", "results_path")))

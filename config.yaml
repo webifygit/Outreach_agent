@@ -15,6 +15,10 @@ run:
   page_timeout_ms: 30000
   site_timeout_s: 180     # hard ceiling per site - a page that wedges the
                           # extractor is recorded as 'timeout' and skipped
+  recycle_browser_every: 50   # retire the browser every N sites - long runs
+                              # leak memory until Chromium falls over
+  max_consecutive_errors: 6   # stop the run if this many sites fail back to back,
+                              # rather than recording failures for untried rows
   nav_retries: 2
   resume: true             # skip rows already marked done in output/state.json
 
