@@ -31,6 +31,12 @@ organization:
   state: "Your State"
   country: "Your Country"
   pitch: "One line describing what you offer and to whom."
+  # Optional links shown in the email signature. Any left blank is omitted
+  # rather than rendered as a dead link.
+  bot_store_url: ""
+  bot_store_title: ""
+  bot_store_blurb: ""
+  linkedin_url: ""
 
 # --- Two separate identity pools ---------------------------------
 #
