@@ -21,6 +21,10 @@ run:
                               # rather than recording failures for untried rows
   nav_retries: 2
   resume: true             # skip rows already marked done in output/state.json
+  skip_already_contacted: true  # never contact a site, or an email address,
+                                # that an earlier run already reached
+  dedupe_scope: host            # host = one message per website (www/https/trailing
+                                # slash all collapse); url = per exact page
 
 # Shared across every sender identity below.
 organization:
@@ -115,3 +119,4 @@ paths:
   state_path: "output/state.json"
   log_path: "output/run.log"
   report_path: "output/report.html"
+  ledger_path: "output/contacted.xlsx"   # forms / emails / skipped, one sheet each

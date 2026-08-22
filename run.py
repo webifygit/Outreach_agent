@@ -28,11 +28,12 @@ from agent import discovery, filler, llm
 from agent.config import (Config, default_config_path, identity_placeholders,
                           jitter, load_env_file, placeholder_advice)
 from agent.evidence import Evidence
+from agent.ledger import build_ledger
 from agent.mailer import Mailer
 from agent.report import build_report
 from agent.senders import pick_sender
 from agent.sheet import load_rows, write_results
-from agent.state import State
+from agent.state import State, norm_site
 from agent.templating import context_for, make_env, render_file, render_string
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -164,7 +165,7 @@ def _embed_label(form: dict) -> str:
     return host or "same-origin iframe"
 
 
-async def process(row, context, cfg, env, mailer, ev, args, logfile):
+async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None):
     url = row["website"]
     idx = row["row_index"]
     form_sender = pick_sender(cfg, idx, "form_senders")
@@ -261,6 +262,19 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile):
         result["detail"] += "no contact form and no email address discoverable"
         return result
 
+    # One message per mailbox, however many sites point at it. Two domains
+    # owned by one company - or a shared agency address - would otherwise each
+    # earn the same person a separate copy.
+    if state is not None and cfg.path("run", "skip_already_contacted", default=True):
+        prior = state.contacted_address(address)
+        if prior:
+            result["method"] = "email"
+            result["email_used"] = address
+            result["status"] = "skipped_duplicate"
+            result["detail"] += (f"{address} already contacted via "
+                                 f"{prior.get('website', '?')} on {prior.get('timestamp', '?')[:10]}")
+            return result
+
     email_sender = pick_sender(cfg, idx, "email_senders")
     email_ctx = {**ctx, "sender": email_sender}
 
@@ -313,16 +327,53 @@ async def main_async(args) -> int:
         bad = ", ".join(f"row {s['row_index']} ({s['website']!r})" for s in skipped_rows[:10])
         more = f" and {len(skipped_rows) - 10} more" if len(skipped_rows) > 10 else ""
         log(f"skipped {len(skipped_rows)} row(s) with no usable website: {bad}{more}", logfile)
+    # The same site listed twice in one sheet - usually as www/non-www or with
+    # a trailing slash - is one business, not two.
+    scope = str(cfg.path("run", "dedupe_scope", default="host"))
+    seen: dict[str, dict] = {}
+    deduped, dupes = [], []
+    for r in rows:
+        key = norm_site(r["website"], scope)
+        if key and key in seen:
+            dupes.append((r, seen[key]))
+            continue
+        if key:
+            seen[key] = r
+        deduped.append(r)
+    if dupes:
+        log(f"sheet has {len(dupes)} duplicate site(s) - keeping the first of each:", logfile)
+        for dup, first in dupes[:8]:
+            log(f"    row {dup['row_index']} {dup['website']} == row {first['row_index']} {first['website']}",
+                logfile)
+        if len(dupes) > 8:
+            log(f"    and {len(dupes) - 8} more", logfile)
+    rows = deduped
+
     limit = args.limit or int(cfg.path("run", "max_sites", default=0))
     if limit:
         rows = rows[:limit]
 
-    state = State(cfg.resolve(cfg.path("paths", "state_path", default="output/state.json")))
+    state = State(cfg.resolve(cfg.path("paths", "state_path", default="output/state.json")),
+                  dedupe_scope=str(cfg.path("run", "dedupe_scope", default="host")))
     if cfg.path("run", "resume", default=True) and not args.no_resume:
         pending = [r for r in rows if not state.is_done(r["website"])]
         if len(pending) < len(rows):
             log(f"resume: skipping {len(rows) - len(pending)} already-processed rows", logfile)
         rows = pending
+
+    if cfg.path("run", "skip_already_contacted", default=True):
+        fresh, already = [], []
+        for r in rows:
+            prior = state.contacted_site(r["website"])
+            (already if prior else fresh).append((r, prior))
+        if already:
+            log(f"skipping {len(already)} site(s) already contacted in an earlier run:", logfile)
+            for r, prior in already[:8]:
+                log(f"    {r['website']} - {prior.get('method', '?')} "
+                    f"{prior.get('status', '?')} on {str(prior.get('timestamp', ''))[:10]}", logfile)
+            if len(already) > 8:
+                log(f"    and {len(already) - 8} more", logfile)
+        rows = [r for r, _ in fresh]
 
     mailer = Mailer(cfg, cfg.live)
     warn = mailer.preflight()
@@ -378,7 +429,7 @@ async def main_async(args) -> int:
                     # browser timeout does not cover, so the whole per-site
                     # pipeline gets one ceiling.
                     res = await asyncio.wait_for(
-                        process(row, context, cfg, env, mailer, ev, args, logfile),
+                        process(row, context, cfg, env, mailer, ev, args, logfile, state),
                         timeout=site_timeout,
                     )
                     break
@@ -433,6 +484,9 @@ async def main_async(args) -> int:
 
     report = build_report(list(state.data.values()), report_mode, report_path)
     log(f"dashboard -> {report}", logfile)
+    ledger = build_ledger(list(state.data.values()),
+                          cfg.resolve(cfg.path("paths", "ledger_path", default="output/contacted.xlsx")))
+    log(f"contacted ledger -> {ledger}", logfile)
 
     tally: dict[str, int] = {}
     for r in results:
