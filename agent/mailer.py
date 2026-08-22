@@ -68,9 +68,12 @@ class Mailer:
         msg["To"] = to_addr
         msg["Subject"] = subject
         msg["Message-ID"] = make_msgid()
-        msg["Reply-To"] = from_email
+        # Replies should land wherever the signature points. The From header
+        # has to stay on the authenticated mailbox - Gmail rejects anything
+        # else - so Reply-To is what actually routes the answer.
+        msg["Reply-To"] = sender.get("signature_email") or from_email
         # Gives recipients a one-click opt-out and keeps mailbox providers happier.
-        msg["List-Unsubscribe"] = f"<mailto:{from_email}?subject=unsubscribe>"
+        msg["List-Unsubscribe"] = f"<mailto:{msg['Reply-To']}?subject=unsubscribe>"
         msg.set_content(body)
         if html:
             msg.add_alternative(html, subtype="html")
