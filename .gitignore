@@ -2,6 +2,12 @@
 config.local.yaml
 .env.local
 .flask_secret
+# Source copy of the approved outreach copy - contains real names, addresses
+# and phone numbers for the team, so it stays out of a public repo.
+templates/contactform_details.txt
+# Lead lists are client data, not code.
+leads_*.xlsx
+leads_*.csv
 
 # Python
 __pycache__/
