@@ -16,7 +16,8 @@ FORM_COLS = ["website", "company_name", "contact_page", "status", "sender",
              "sender_email", "detail", "screenshot_after", "timestamp"]
 MAIL_COLS = ["website", "company_name", "email_used", "status", "sender",
              "sender_email", "detail", "screenshot_after", "timestamp"]
-SKIP_COLS = ["website", "company_name", "status", "detail", "timestamp"]
+SKIP_COLS = ["website", "company_name", "method", "email_used", "contact_page",
+             "first_contacted", "detail", "timestamp"]
 
 
 def _frame(rows: list[dict], cols: list[str]) -> pd.DataFrame:
@@ -27,6 +28,10 @@ def _frame(rows: list[dict], cols: list[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=cols)
     return df[cols].sort_values("timestamp")
+
+
+def _sheet_name(base: str, n: int) -> str:
+    return f"{base} ({n})"[:31]   # Excel caps sheet names at 31 chars
 
 
 def build_ledger(records: list[dict], path: str | Path) -> Path:
@@ -40,7 +45,10 @@ def build_ledger(records: list[dict], path: str | Path) -> Path:
     skipped = [r for r in records if r.get("status") == "skipped_duplicate"]
 
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
-        _frame(forms, FORM_COLS).to_excel(xl, sheet_name="Forms submitted", index=False)
-        _frame(mails, MAIL_COLS).to_excel(xl, sheet_name="Emails sent", index=False)
-        _frame(skipped, SKIP_COLS).to_excel(xl, sheet_name="Skipped as duplicate", index=False)
+        _frame(forms, FORM_COLS).to_excel(
+            xl, sheet_name=_sheet_name("Forms submitted", len(forms)), index=False)
+        _frame(mails, MAIL_COLS).to_excel(
+            xl, sheet_name=_sheet_name("Emails sent", len(mails)), index=False)
+        _frame(skipped, SKIP_COLS).to_excel(
+            xl, sheet_name=_sheet_name("Already approached", len(skipped)), index=False)
     return path

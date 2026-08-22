@@ -355,25 +355,52 @@ async def main_async(args) -> int:
 
     state = State(cfg.resolve(cfg.path("paths", "state_path", default="output/state.json")),
                   dedupe_scope=str(cfg.path("run", "dedupe_scope", default="host")))
+    # Re-uploading a sheet must not make already-approached rows disappear: they
+    # are carried through as their own list, into the results file, the
+    # dashboard and the ledger. Deliberately NOT written back into state - that
+    # is keyed by URL, so recording a skip would overwrite the very record of
+    # the original contact we are trying to preserve.
+    dup_skips: list[dict] = []
+    if cfg.path("run", "skip_already_contacted", default=True):
+        fresh = []
+        for r in rows:
+            prior = state.contacted_site(r["website"])
+            if not prior:
+                fresh.append(r)
+                continue
+            when = str(prior.get("timestamp", ""))[:10]
+            how = prior.get("method", "?")
+            via = prior.get("email_used") or prior.get("contact_page") or prior.get("website", "")
+            dup_skips.append({
+                "row_index": r["row_index"], "website": r["website"],
+                "company_name": r["company_name"],
+                "method": how, "status": "skipped_duplicate",
+                "detail": f"already approached by {how} ({prior.get('status', '?')}) on {when}"
+                          + (f" via {via}" if via else ""),
+                "email_used": prior.get("email_used", ""),
+                "contact_page": prior.get("contact_page", ""),
+                "sender": prior.get("sender", ""),
+                "sender_email": prior.get("sender_email", ""),
+                "first_contacted": prior.get("timestamp", ""),
+                "screenshot_before": prior.get("screenshot_before", ""),
+                "screenshot_after": prior.get("screenshot_after", ""),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            })
+        if dup_skips:
+            log(f"{len(dup_skips)} site(s) already approached - listed as skipped_duplicate, not re-contacted:",
+                logfile)
+            for d in dup_skips[:8]:
+                log(f"    {d['website']} - {d['detail']}", logfile)
+            if len(dup_skips) > 8:
+                log(f"    and {len(dup_skips) - 8} more", logfile)
+        rows = fresh
+
     if cfg.path("run", "resume", default=True) and not args.no_resume:
         pending = [r for r in rows if not state.is_done(r["website"])]
         if len(pending) < len(rows):
             log(f"resume: skipping {len(rows) - len(pending)} already-processed rows", logfile)
         rows = pending
 
-    if cfg.path("run", "skip_already_contacted", default=True):
-        fresh, already = [], []
-        for r in rows:
-            prior = state.contacted_site(r["website"])
-            (already if prior else fresh).append((r, prior))
-        if already:
-            log(f"skipping {len(already)} site(s) already contacted in an earlier run:", logfile)
-            for r, prior in already[:8]:
-                log(f"    {r['website']} - {prior.get('method', '?')} "
-                    f"{prior.get('status', '?')} on {str(prior.get('timestamp', ''))[:10]}", logfile)
-            if len(already) > 8:
-                log(f"    and {len(already) - 8} more", logfile)
-        rows = [r for r, _ in fresh]
 
     mailer = Mailer(cfg, cfg.live)
     warn = mailer.preflight()
@@ -455,7 +482,7 @@ async def main_async(args) -> int:
             state.record(row["website"], res)
             since_recycle += 1
             log(f"    -> {res['method'] or '-'} / {res['status']} :: {res['detail'][:110]}", logfile)
-            build_report(list(state.data.values()), report_mode, report_path)
+            build_report(list(state.data.values()) + dup_skips, report_mode, report_path)
 
             # Burning through the rest of the sheet recording failures is worse
             # than stopping: the rows look attempted when they never were.
@@ -478,18 +505,18 @@ async def main_async(args) -> int:
             pass
 
     mailer.close()
-    out = write_results(results, cfg.resolve(cfg.path("paths", "results_path")))
+    out = write_results(dup_skips + results, cfg.resolve(cfg.path("paths", "results_path")))
     log(f"done - {len(results)} rows -> {out}", logfile)
     log(f"screenshots -> {ev.dir}", logfile)
 
-    report = build_report(list(state.data.values()), report_mode, report_path)
+    report = build_report(list(state.data.values()) + dup_skips, report_mode, report_path)
     log(f"dashboard -> {report}", logfile)
-    ledger = build_ledger(list(state.data.values()),
+    ledger = build_ledger(list(state.data.values()) + dup_skips,
                           cfg.resolve(cfg.path("paths", "ledger_path", default="output/contacted.xlsx")))
     log(f"contacted ledger -> {ledger}", logfile)
 
     tally: dict[str, int] = {}
-    for r in results:
+    for r in dup_skips + results:
         tally[r["status"]] = tally.get(r["status"], 0) + 1
     log("summary: " + ", ".join(f"{k}={v}" for k, v in sorted(tally.items())), logfile)
     return 0
