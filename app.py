@@ -274,6 +274,57 @@ def go_live():
     return start_run(path, live=True, headless=True, limit=0)
 
 
+@app.post("/clear-drafts")
+def clear_drafts():
+    """Remove dry-run rows from the history. Never touches a real contact.
+
+    state.json is the only record of who has actually been written to, so this
+    filters by status rather than deleting the file, and takes a timestamped
+    backup first. Anything sent, submitted or skipped as a duplicate stays.
+    """
+    with _lock:
+        proc = STATE["proc"]
+        if proc is not None and proc.poll() is None:
+            return jsonify(error="a run is in progress - stop it before clearing drafts"), 409
+
+    if not STATE_FILE.exists():
+        return jsonify(removed=0, kept=0, backup="", note="nothing to clear")
+
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return jsonify(error=f"could not read the history: {exc}"), 500
+
+    drafts = {u: r for u, r in data.items() if r.get("status") == "dry_run"}
+    kept = {u: r for u, r in data.items() if r.get("status") != "dry_run"}
+    if not drafts:
+        return jsonify(removed=0, kept=len(kept), backup="", note="no drafts to clear")
+
+    backup = STATE_FILE.with_name(f"state-backup-{datetime.now():%Y%m%d_%H%M%S}.json")
+    try:
+        backup.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(kept, indent=2, default=str), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except OSError as exc:
+        return jsonify(error=f"could not write the history: {exc}"), 500
+
+    # The dashboards and ledger are derived from state, so rebuild them.
+    try:
+        from agent.ledger import build_ledger
+        from agent.report import build_report
+        rows = list(kept.values())
+        build_report(rows, "dry_run", REPORT_PATH)
+        build_report(rows, "dry_run",
+                     cfg.resolve(cfg.path("paths", "report_all_path", default="output/report_all.html")))
+        build_ledger(rows, cfg.resolve(cfg.path("paths", "ledger_path", default="output/contacted.xlsx")))
+    except Exception:
+        pass   # the history is already saved; a stale view is not worth a 500
+
+    contacted = sum(1 for r in kept.values() if r.get("status") in ("sent", "success", "uncertain"))
+    return jsonify(removed=len(drafts), kept=len(kept), contacted=contacted, backup=backup.name)
+
+
 @app.post("/stop")
 def stop():
     with _lock:
@@ -678,6 +729,7 @@ INDEX_HTML = r"""<!doctype html>
 
     <button class="btn-primary" id="startBtn" disabled>Start run</button>
     <button id="golive" hidden style="margin-top:10px;width:100%;">Submit dry runs live</button>
+    <button id="cleardrafts" hidden style="margin-top:8px;width:100%;">Clear all drafts</button>
     <button class="btn-stop" id="stopBtn" hidden>Stop run</button>
 
     <div style="margin-top:16px;">
@@ -817,9 +869,15 @@ INDEX_HTML = r"""<!doctype html>
       stopBtn.hidden = false;
       startBtn.disabled = true;
       golive.hidden = true;
+      cleardrafts.hidden = true;
     } else {
       stopBtn.hidden = true;
       startBtn.disabled = !uploadedPath;
+      cleardrafts.hidden = !(s.dry_runs > 0);
+      if (s.dry_runs > 0) {
+        cleardrafts.dataset.count = s.dry_runs;
+        cleardrafts.textContent = 'Clear ' + s.dry_runs + ' draft' + (s.dry_runs === 1 ? '' : 's');
+      }
       if (s.can_go_live && s.dry_runs > 0) {
         golive.hidden = false;
         golive.disabled = false;
@@ -855,6 +913,26 @@ INDEX_HTML = r"""<!doctype html>
     const data = await res.json();
     if (data.error) { alert(data.error); golive.disabled = false; return; }
     startPolling();
+  });
+
+  const cleardrafts = document.getElementById('cleardrafts');
+  cleardrafts.addEventListener('click', async () => {
+    const n = cleardrafts.dataset.count || '0';
+    if (!confirm('Clear ' + n + ' draft row(s)?\n\n' +
+                 'Only dry runs are removed. Everyone already emailed or ' +
+                 'submitted to is kept, so they still will not be contacted twice.\n\n' +
+                 'A backup of the history is saved first.')) return;
+    cleardrafts.disabled = true;
+    const res = await fetch('/clear-drafts', { method: 'POST' });
+    const data = await res.json();
+    cleardrafts.disabled = false;
+    if (data.error) { alert(data.error); return; }
+    alert('Cleared ' + data.removed + ' draft(s).\n' +
+          data.contacted + ' real contact(s) kept.' +
+          (data.backup ? '\nBackup: ' + data.backup : ''));
+    poll();
+    const frame = document.querySelector('#reportFrame, iframe');
+    if (frame && frame.dataset.base) frame.src = frame.dataset.base + '?t=' + Date.now();
   });
 
   poll(); // pick up an already-running process on page load
