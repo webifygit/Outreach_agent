@@ -342,6 +342,50 @@ async def collect_emails(page, site_host: str) -> list[str]:
     return clean[:5]
 
 
+async def settle(page, extra_ms: int = 1800) -> None:
+    """Give a JS-rendered page a moment to actually render.
+
+    Reading the DOM immediately after domcontentloaded finds an empty shell on
+    any site that builds its form client-side.
+    """
+    try:
+        await asyncio.wait_for(page.wait_for_load_state("networkidle"), timeout=6)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_timeout(extra_ms)
+    except Exception:
+        pass
+
+
+async def harvest_emails(page, host: str, candidates: list[str], timeout: int,
+                         limit: int = 4) -> list[str]:
+    """Look for an address on this page, then on the contact pages.
+
+    A homepage often lists none while /contact-us/ lists several, so stopping
+    at the current page is what leaves a site with no route at all.
+    """
+    found: list[str] = list(await collect_emails(page, host))
+    if found:
+        return found
+
+    start_url = page.url
+    for cand in candidates[:limit]:
+        if cand == start_url:
+            continue
+        try:
+            resp = await page.goto(cand, wait_until="domcontentloaded", timeout=timeout)
+            if resp and resp.status >= 400:
+                continue
+            await settle(page, 1200)
+        except Exception:
+            continue
+        found = list(await collect_emails(page, host))
+        if found:
+            return found
+    return found
+
+
 async def find_contact_links(page, base_url: str, limit: int) -> list[str]:
     """Links on the current page whose text or href smells like a contact page."""
     try:

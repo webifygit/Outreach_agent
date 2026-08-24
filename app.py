@@ -122,7 +122,8 @@ def _require_auth():
     return redirect(f"/login?next={request.path}")
 
 _lock = threading.Lock()
-STATE: dict = {"proc": None, "input": None, "live": False, "started_at": None}
+STATE: dict = {"proc": None, "input": None, "input_path": None, "live": False,
+               "started_at": None, "stopped_by_user": False, "restarts": 0}
 
 
 def _run_report_url() -> str:
@@ -167,6 +168,30 @@ def _last_input() -> Path | None:
     return None
 
 
+LOCK_FILE = cfg.resolve(cfg.path("paths", "lock_path", default="output/run.lock"))
+
+
+def _external_run_active() -> bool:
+    """Is a run in flight that this app did not start?
+
+    run.py leaves a pid file while it works. A file whose process is gone is
+    stale - from a crash or a kill - and must not block the UI forever.
+    """
+    try:
+        pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)          # signal 0: existence check, changes nothing
+    except (OSError, ProcessLookupError):
+        try:
+            LOCK_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
 def _dry_run_count() -> int:
     """Rows filled but never submitted - what "go live" would actually act on."""
     try:
@@ -178,11 +203,12 @@ def _dry_run_count() -> int:
 
 def _status() -> dict:
     proc = STATE["proc"]
-    running = proc is not None and proc.poll() is None
+    running = (proc is not None and proc.poll() is None) or _external_run_active()
     code = None if proc is None else proc.poll()
     return {
         "problem": _last_problem() if (code not in (0, None)) else "",
         "dry_runs": _dry_run_count(),
+        "restarts": STATE.get("restarts", 0),
         "can_go_live": _last_input() is not None and not running,
         "running": running,
         "returncode": None if proc is None else proc.poll(),
@@ -214,7 +240,7 @@ def upload():
 def start():
     with _lock:
         proc = STATE["proc"]
-        if proc is not None and proc.poll() is None:
+        if (proc is not None and proc.poll() is None) or _external_run_active():
             return jsonify(error="a run is already in progress"), 409
 
         data = request.get_json(force=True, silent=True) or {}
@@ -234,8 +260,57 @@ def start():
         return start_run(input_path, live, headless, limit)
 
 
+MAX_RESTARTS = 25          # a ceiling, not an expectation
+
+
+def _spawn(argv, log_fh):
+    log_fh.write(f"\n--- launched {datetime.now():%Y-%m-%d %H:%M:%S} :: {' '.join(argv)} ---\n")
+    log_fh.flush()
+    return subprocess.Popen(argv, cwd=str(ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
+
+
+def _supervise(argv, log_fh):
+    """Relaunch the run if it dies unexpectedly, until it finishes or is stopped.
+
+    The lock file is the signal: run.py removes it on a clean finish, so a lock
+    still present after the process has gone means it died mid-run.
+    """
+    restarts = 0
+    try:
+        while True:
+            proc = STATE["proc"]
+            proc.wait()
+
+            if STATE.get("stopped_by_user"):
+                log_fh.write("--- stopped by user; not restarting ---\n")
+                break
+            if not LOCK_FILE.exists():
+                log_fh.write("--- run finished cleanly ---\n")
+                break
+            if restarts >= MAX_RESTARTS:
+                log_fh.write(f"--- died again; restart limit ({MAX_RESTARTS}) reached, giving up ---\n")
+                break
+
+            restarts += 1
+            try:
+                LOCK_FILE.unlink(missing_ok=True)   # the dead run's lock
+            except OSError:
+                pass
+            log_fh.write(f"--- run died unexpectedly; restart {restarts}/{MAX_RESTARTS}, "
+                         f"resuming from state.json ---\n")
+            log_fh.flush()
+            with _lock:
+                STATE["proc"] = _spawn(argv, log_fh)
+                STATE["restarts"] = restarts
+    finally:
+        try:
+            log_fh.flush()
+        except Exception:
+            pass
+
+
 def start_run(input_path: Path, live: bool, headless: bool, limit: int):
-    """Launch run.py. Caller owns the "already running" check."""
+    """Launch run.py under supervision. Caller owns the "already running" check."""
     argv = [sys.executable, "run.py", "--input", str(input_path), "--yes"]
     if live:
         argv.append("--live")
@@ -246,12 +321,16 @@ def start_run(input_path: Path, live: bool, headless: bool, limit: int):
 
     LAUNCH_LOG.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(LAUNCH_LOG, "a", encoding="utf-8")
-    log_fh.write(f"\n--- launched {datetime.now():%Y-%m-%d %H:%M:%S} :: {' '.join(argv)} ---\n")
-    log_fh.flush()
+    try:
+        LOCK_FILE.unlink(missing_ok=True)     # clear any lock left by an earlier crash
+    except OSError:
+        pass
 
-    proc = subprocess.Popen(argv, cwd=str(ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
+    proc = _spawn(argv, log_fh)
     STATE.update(proc=proc, input=input_path.name, input_path=str(input_path),
-                 live=live, started_at=datetime.now().isoformat(timespec="seconds"))
+                 live=live, started_at=datetime.now().isoformat(timespec="seconds"),
+                 stopped_by_user=False, restarts=0)
+    threading.Thread(target=_supervise, args=(argv, log_fh), daemon=True).start()
     return jsonify(_status())
 
 
@@ -265,7 +344,7 @@ def go_live():
     """
     with _lock:
         proc = STATE["proc"]
-        if proc is not None and proc.poll() is None:
+        if (proc is not None and proc.poll() is None) or _external_run_active():
             return jsonify(error="a run is already in progress"), 409
         path = _last_input()
         if path is None:
@@ -284,8 +363,8 @@ def clear_drafts():
     """
     with _lock:
         proc = STATE["proc"]
-        if proc is not None and proc.poll() is None:
-            return jsonify(error="a run is in progress - stop it before clearing drafts"), 409
+        if (proc is not None and proc.poll() is None) or _external_run_active():
+            return jsonify(error="a run is in progress - wait for it to finish before clearing drafts"), 409
 
     if not STATE_FILE.exists():
         return jsonify(removed=0, kept=0, backup="", note="nothing to clear")
@@ -327,6 +406,7 @@ def clear_drafts():
 
 @app.post("/stop")
 def stop():
+    STATE["stopped_by_user"] = True
     with _lock:
         proc = STATE["proc"]
         if proc is not None and proc.poll() is None:
@@ -401,6 +481,71 @@ def _esc(value) -> str:
 
 def _when(row) -> str:
     return _esc(str(row.get("timestamp"))[:16].replace("T", " "))
+
+
+@app.get("/assets/<path:name>")
+def assets(name):
+    """Static files for the console (the logo). Confined to ui/assets."""
+    root = (ROOT / "ui" / "assets").resolve()
+    target = (root / name).resolve()
+    if not (target == root or target.is_relative_to(root)) or not target.exists():
+        return "not found", 404
+    return send_from_directory(target.parent, target.name)
+
+
+@app.get("/api/rows")
+def api_rows():
+    """Read-only feed for the console: this sheet's rows plus lifetime totals.
+
+    Additive - nothing here writes, and every number comes from the files the
+    agent already produces.
+    """
+    rows, meta = [], {}
+    rows_path = cfg.resolve(cfg.path("paths", "rows_json_path", default="output/run_rows.json"))
+    try:
+        payload = json.loads(rows_path.read_text(encoding="utf-8"))
+        rows = payload.get("rows", [])
+        meta = {k: payload.get(k) for k in ("mode", "total", "done", "generated")}
+    except Exception:
+        pass
+
+    overall = {"sites": 0, "emails": 0, "forms": 0, "by_status": {}}
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        overall["sites"] = len(data)
+        for r in data.values():
+            st = str(r.get("status") or "unknown")
+            overall["by_status"][st] = overall["by_status"].get(st, 0) + 1
+            if r.get("status") in ("sent", "success", "uncertain"):
+                if r.get("method") == "email":
+                    overall["emails"] += 1
+                elif r.get("method") == "form":
+                    overall["forms"] += 1
+    except Exception:
+        pass
+
+    def shot(path):
+        """Turn an absolute evidence path into something the browser can fetch."""
+        if not path:
+            return ""
+        try:
+            rel = Path(path).resolve().relative_to(ROOT.resolve())
+        except (ValueError, OSError):
+            return ""
+        return "/files/" + str(rel).replace("\\", "/")
+
+    slim = []
+    for r in rows:
+        slim.append({
+            "website": r.get("website", ""), "company": r.get("company_name", ""),
+            "method": r.get("method", ""), "status": r.get("status", ""),
+            "detail": r.get("detail", ""), "email_used": r.get("email_used", ""),
+            "contact_page": r.get("contact_page", ""), "sender": r.get("sender", ""),
+            "timestamp": str(r.get("timestamp", "")),
+            "shot_before": shot(r.get("screenshot_before", "")),
+            "shot_after": shot(r.get("screenshot_after", "")),
+        })
+    return jsonify(rows=slim, meta=meta, overall=overall)
 
 
 @app.get("/overall")
@@ -520,9 +665,17 @@ CONTACTED_HTML = """<!doctype html>
 """
 
 
+CONSOLE_FILE = ROOT / "ui" / "console.html"
+
+
 @app.get("/")
 def index():
-    return INDEX_HTML
+    """The console. Served from ui/console.html so the markup stays editable;
+    falls back to the built-in page if that file is ever missing."""
+    try:
+        return CONSOLE_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return INDEX_HTML
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -690,6 +843,178 @@ INDEX_HTML = r"""<!doctype html>
     min-height: 480px; display: flex; align-items: center; justify-content: center; }
   .dash-wrap iframe { width: 100%; height: 78vh; border: 0; display: block; }
   .placeholder { color: var(--muted); font-size: 13.5px; text-align: center; padding: 40px; }
+
+  /* ================================================================
+     Console shell + colour, appended so it wins over the rules above.
+     ================================================================ */
+
+  :root {
+    --ink:        #0B1020;
+    --indigo:     #4F46E5;
+    --violet:     #7C3AED;
+    --cyan:       #06B6D4;
+    --emerald:    #059669;
+    --amber:      #D97706;
+    --rose:       #E11D48;
+    --slate:      #64748B;
+    --edge:       rgba(15,23,42,.10);
+    --lift:       0 1px 2px rgba(11,16,32,.05), 0 10px 30px rgba(11,16,32,.07);
+    --lift-hover: 0 2px 6px rgba(11,16,32,.08), 0 18px 44px rgba(11,16,32,.13);
+    --accent:     #4F46E5;
+    --accent-2:   #06B6D4;
+    --blob-1: #4F46E5; --blob-2: #06B6D4; --blob-3: #7C3AED; --blob-4: #059669;
+    --blob-opacity: .13;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink:        #E6EAF6;
+      --edge:       rgba(148,163,184,.20);
+      --lift:       0 1px 2px rgba(0,0,0,.45), 0 10px 30px rgba(0,0,0,.35);
+      --lift-hover: 0 2px 6px rgba(0,0,0,.5), 0 18px 44px rgba(0,0,0,.45);
+      --indigo:     #818CF8;
+      --violet:     #A78BFA;
+      --cyan:       #22D3EE;
+      --emerald:    #34D399;
+      --amber:      #FBBF24;
+      --rose:       #FB7185;
+      --accent:     #818CF8;
+      --accent-2:   #22D3EE;
+      --blob-opacity: .17;
+    }
+  }
+
+  /* ---- the shell: window-height, panels scroll on their own ---------- */
+  @media (min-width: 861px) {
+    html { height: 100%; }
+    body {
+      height: 100vh;
+      overflow: hidden;              /* the page itself never scrolls */
+      display: flex;
+      flex-direction: column;
+    }
+    .layout {
+      flex: 1 1 auto;
+      min-height: 0;                 /* without this the children cannot shrink */
+      align-items: stretch;          /* was start - that is what capped the height */
+      gap: 22px;
+    }
+    .card {
+      overflow-y: auto;
+      max-height: 100%;
+      scrollbar-width: thin;
+    }
+    .dash-wrap {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .dash-wrap iframe { flex: 1 1 auto; height: auto; min-height: 0; }
+    .placeholder { flex: 1 1 auto; }
+  }
+
+  /* ---- surfaces ------------------------------------------------------ */
+  .card, .dash-wrap {
+    border: 1px solid var(--edge);
+    border-radius: 16px;
+    box-shadow: var(--lift);
+    transition: box-shadow .28s ease, transform .28s ease;
+  }
+  .card:hover, .dash-wrap:hover { box-shadow: var(--lift-hover); }
+
+  /* a coloured seam along the top of each panel */
+  .card { position: relative; overflow-x: hidden; }
+  .card::before, .dash-wrap::before {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; z-index: 2;
+    background: linear-gradient(90deg, var(--indigo), var(--violet), var(--cyan), var(--emerald));
+    background-size: 300% 100%;
+    animation: seam 14s linear infinite;
+  }
+  .dash-wrap { position: relative; }
+  @keyframes seam { to { background-position: 300% 0; } }
+
+  /* ---- headline ------------------------------------------------------ */
+  h1 {
+    background: linear-gradient(100deg, var(--indigo), var(--cyan) 55%, var(--violet));
+    -webkit-background-clip: text; background-clip: text;
+    color: transparent; -webkit-text-fill-color: transparent;
+    letter-spacing: -.02em;
+  }
+
+  /* ---- navigation chips instead of inline links ---------------------- */
+  .sub a {
+    display: inline-block; text-decoration: none;
+    padding: 5px 12px; margin-left: 6px; border-radius: 999px;
+    border: 1px solid var(--edge); background: var(--plane);
+    font-size: 13px; font-weight: 600;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+  }
+  .sub a:hover {
+    transform: translateY(-1px);
+    border-color: var(--accent);
+    box-shadow: 0 6px 18px rgba(79,70,229,.18);
+  }
+
+  /* ---- controls ------------------------------------------------------ */
+  button, .btn-primary, .btn-stop {
+    transition: transform .16s ease, box-shadow .16s ease, filter .16s ease;
+  }
+  button:hover:not(:disabled) { transform: translateY(-1px); }
+  button:active:not(:disabled) { transform: translateY(0) scale(.995); }
+  .btn-primary:not(:disabled) {
+    background: linear-gradient(135deg, var(--indigo), var(--violet));
+    border-color: transparent; color: #fff;
+    box-shadow: 0 8px 22px rgba(79,70,229,.30);
+  }
+  .btn-primary:not(:disabled):hover { box-shadow: 0 12px 30px rgba(79,70,229,.42); }
+  #golive:not(:disabled) {
+    background: linear-gradient(135deg, var(--emerald), #0d9488);
+    color: #fff; border-color: transparent; font-weight: 600;
+    box-shadow: 0 8px 22px rgba(5,150,105,.28);
+  }
+  #cleardrafts:not(:disabled) {
+    border-color: color-mix(in srgb, var(--amber) 45%, transparent);
+    color: var(--amber); font-weight: 600;
+  }
+  #cleardrafts:not(:disabled):hover { background: color-mix(in srgb, var(--amber) 12%, transparent); }
+  .btn-stop { background: linear-gradient(135deg, var(--rose), #be123c); color: #fff; border-color: transparent; }
+
+  /* ---- drop zone ----------------------------------------------------- */
+  .drop { transition: border-color .2s ease, background .2s ease, transform .2s ease; }
+  .drop:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .drop.drag {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    transform: scale(1.01);
+  }
+
+  /* ---- status pill --------------------------------------------------- */
+  .status-pill { transition: color .25s ease; }
+  .status-pill.running .dot { background: var(--cyan); }
+  .status-pill.done .dot    { background: var(--emerald); }
+  .status-pill.error .dot   { background: var(--rose); }
+
+  /* while a run is going, the dashboard edge breathes */
+  .dash-wrap.is-running::before { animation: seam 3s linear infinite; }
+
+  /* ---- entrance ------------------------------------------------------ */
+  @keyframes riseIn {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .live-banner { animation: riseIn .45s ease both; }
+  h1           { animation: riseIn .45s ease .04s both; }
+  .sub         { animation: riseIn .45s ease .08s both; }
+  .card        { animation: riseIn .5s ease .12s both; }
+  .dash-wrap   { animation: riseIn .5s ease .18s both; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important;
+    }
+  }
 </style>
 
 <div class="bg-blobs" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
@@ -729,7 +1054,7 @@ INDEX_HTML = r"""<!doctype html>
 
     <button class="btn-primary" id="startBtn" disabled>Start run</button>
     <button id="golive" hidden style="margin-top:10px;width:100%;">Submit dry runs live</button>
-    <button id="cleardrafts" hidden style="margin-top:8px;width:100%;">Clear all drafts</button>
+    <button id="cleardrafts" hidden style="margin-top:8px;width:100%;">Clear all dry runs</button>
     <button class="btn-stop" id="stopBtn" hidden>Stop run</button>
 
     <div style="margin-top:16px;">
@@ -866,17 +1191,19 @@ INDEX_HTML = r"""<!doctype html>
     }
     if (s.running) {
       setPill('running', 'Running' + (s.input ? ' - ' + s.input : ''));
+      document.getElementById('dashWrap').classList.add('is-running');
       stopBtn.hidden = false;
       startBtn.disabled = true;
       golive.hidden = true;
       cleardrafts.hidden = true;
     } else {
       stopBtn.hidden = true;
+      document.getElementById('dashWrap').classList.remove('is-running');
       startBtn.disabled = !uploadedPath;
       cleardrafts.hidden = !(s.dry_runs > 0);
       if (s.dry_runs > 0) {
         cleardrafts.dataset.count = s.dry_runs;
-        cleardrafts.textContent = 'Clear ' + s.dry_runs + ' draft' + (s.dry_runs === 1 ? '' : 's');
+        cleardrafts.textContent = 'Clear ' + s.dry_runs + ' saved dry run' + (s.dry_runs === 1 ? '' : 's');
       }
       if (s.can_go_live && s.dry_runs > 0) {
         golive.hidden = false;
@@ -918,8 +1245,8 @@ INDEX_HTML = r"""<!doctype html>
   const cleardrafts = document.getElementById('cleardrafts');
   cleardrafts.addEventListener('click', async () => {
     const n = cleardrafts.dataset.count || '0';
-    if (!confirm('Clear ' + n + ' draft row(s)?\n\n' +
-                 'Only dry runs are removed. Everyone already emailed or ' +
+    if (!confirm('Clear ' + n + ' saved dry-run row(s)?\n\n' +
+                 'Only saved dry runs are removed - sites filled in but never submitted or sent. Everyone actually emailed or ' +
                  'submitted to is kept, so they still will not be contacted twice.\n\n' +
                  'A backup of the history is saved first.')) return;
     cleardrafts.disabled = true;
@@ -927,7 +1254,7 @@ INDEX_HTML = r"""<!doctype html>
     const data = await res.json();
     cleardrafts.disabled = false;
     if (data.error) { alert(data.error); return; }
-    alert('Cleared ' + data.removed + ' draft(s).\n' +
+    alert('Cleared ' + data.removed + ' dry run(s).\n' +
           data.contacted + ' real contact(s) kept.' +
           (data.backup ? '\nBackup: ' + data.backup : ''));
     poll();

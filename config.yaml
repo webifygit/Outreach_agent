@@ -121,3 +121,5 @@ paths:
   report_path: "output/report.html"   # this sheet only
   report_all_path: "output/report_all.html"   # every sheet ever run
   ledger_path: "output/contacted.xlsx"   # forms / emails / skipped, one sheet each
+  lock_path: "output/run.lock"   # pid file so the UI can see a CLI run too
+  rows_json_path: "output/run_rows.json"   # console feed for the current sheet

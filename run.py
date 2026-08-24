@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import random
 import sys
 import time
@@ -64,15 +66,18 @@ async def open_page(context, url: str, timeout: int, retries: int):
     return page, last
 
 
-async def locate_form(page, cfg, timeout: int, retries: int, context):
+async def locate_form(page, cfg, timeout: int, retries: int, context,
+                      contact_candidates: list | None = None):
     """Return (page, ranked, contact_url) for the best contact page we can find.
 
     ``ranked`` holds (score, form, frame) triples, best first. The frame is part
     of the result because a form may live inside an iframe (HubSpot, Jotform,
     Google Forms...) and every later step has to be scoped to its own document.
     """
+    contact_candidates = contact_candidates if contact_candidates is not None else []
     last_good_url = page.url  # most recent page that actually loaded (status < 400)
     best = (page, [], page.url)  # always a real page, even if no form is ever found
+    await discovery.settle(page, 900)
     ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
     if ranked and ranked[0][0] >= 60:
         return page, ranked, page.url
@@ -82,6 +87,7 @@ async def locate_form(page, cfg, timeout: int, retries: int, context):
     for guess in discovery.guessed_paths(page.url):
         if guess not in candidates and len(candidates) < limit:
             candidates.append(guess)
+    contact_candidates.extend(candidates)
 
     best_score = ranked[0][0] if ranked else -999
     if ranked:
@@ -96,7 +102,13 @@ async def locate_form(page, cfg, timeout: int, retries: int, context):
         except Exception:
             continue
         last_good_url = page.url
+        await discovery.settle(page)
         ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
+        if (not ranked or ranked[0][0] < 40):
+            # Nothing yet is usually a form that has not mounted, not a page
+            # without one. Look once more before writing the page off.
+            await discovery.settle(page, 2000)
+            ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if ranked and ranked[0][0] > best_score:
             best_score, best = ranked[0][0], (page, ranked, page.url)
         if best_score >= 60:
@@ -208,7 +220,9 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
 
     subject = render_string(env, str(cfg.path("form", "subject_line", default="Enquiry")), ctx)
 
-    page, ranked, contact_url = await locate_form(page, cfg, timeout, retries, context)
+    contact_candidates: list[str] = []
+    page, ranked, contact_url = await locate_form(page, cfg, timeout, retries, context,
+                                                  contact_candidates)
     result["contact_page"] = contact_url
 
     top_score, top_form, top_frame = (ranked[0] if ranked else (-999, None, None))
@@ -223,16 +237,21 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     # email address - the recipient gets an enquiry that says nothing. The
     # email fallback carries the full pitch, so prefer it. Set
     # form.require_message: false to submit such forms anyway.
+    # A form we decline here is kept: if no email turns up, using it is better
+    # than not contacting the business at all.
+    spare_form_url = ""
     if use_form and cfg.path("form", "require_message", default=True):
         if "message" not in filler.classify(top_form["fields"]):
             use_form = False
-            result["detail"] += "form has no message field (pitch could not be included) - falling back to email. "
+            spare_form_url = contact_url or page.url
+            result["detail"] += "form has no message field (pitch could not be included) - preferring email. "
 
-    if use_form:
+    async def attempt_form(form, frame) -> bool:
+        """Fill and submit one form. True if this row is finished with."""
         result["method"] = "form"
-        if top_form.get("in_iframe"):
-            result["detail"] += f"embedded form in iframe ({_embed_label(top_form)}). "
-        report = await filler.fill_form(top_frame, top_form, cfg, ctx, env, subject)
+        if form.get("in_iframe"):
+            result["detail"] += f"embedded form in iframe ({_embed_label(form)}). "
+        report = await filler.fill_form(frame, form, cfg, ctx, env, subject)
         result["screenshot_before"] = await ev.shot(page, idx, url, "01_filled")
 
         if report["missing_required"]:
@@ -241,19 +260,18 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
         if not cfg.live:
             result["status"] = "dry_run"
             result["detail"] += f"filled {report['roles']} - not submitted (dry run)"
-            await page.close()
-            return result
+            return True
 
         before_url = page.url
-        click = await filler.submit_form(top_frame, top_form["form_key"], timeout)
-        status, detail = await filler.verify_submission(
-            page, top_frame, before_url, top_form["form_key"]
-        )
+        click = await filler.submit_form(frame, form["form_key"], timeout)
+        status, detail = await filler.verify_submission(page, frame, before_url, form["form_key"])
         result["screenshot_after"] = await ev.shot(page, idx, url, "02_after_submit")
         result["status"] = status
         result["detail"] += f"{click}; {detail}"
+        return status != "failed"
 
-        if status != "failed":
+    if use_form:
+        if await attempt_form(top_form, top_frame):
             await page.close()
             return result
         result["detail"] += " | retrying via email"
@@ -261,8 +279,28 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     # ---- email fallback -------------------------------------------------
     host = urlparse(url).netloc
     sheet_email = str(row.get("email") or "").strip()
-    scraped = await discovery.collect_emails(page, host)
+    # Look past the current page: the address is usually on /contact-us/, and
+    # a site with no reachable address at all is the one outcome that leaves
+    # the agent with nothing to do.
+    scraped = await discovery.harvest_emails(page, host, contact_candidates, timeout)
     address = sheet_email or (scraped[0] if scraped else "")
+
+    if not address and spare_form_url:
+        # Nothing to write to. The form set aside earlier is the only way in,
+        # so take it - the message tiers are dropped, but every other field
+        # still carries who we are and why we are writing.
+        result["detail"] += "no email address found either - using the form anyway. "
+        try:
+            await page.goto(spare_form_url, wait_until="domcontentloaded", timeout=timeout)
+            await discovery.settle(page)
+            again = discovery.rank_forms(await discovery.forms_everywhere(page))
+        except Exception:
+            again = []
+        if again and again[0][0] >= 40:
+            score2, form2, frame2 = again[0]
+            if await attempt_form(form2, frame2):
+                await page.close()
+                return result
 
     if not result["screenshot_before"]:
         result["screenshot_before"] = await ev.shot(page, idx, url, "01_page")
@@ -308,6 +346,54 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     if status == "sent":
         await asyncio.sleep(jitter(cfg.path("email", "per_send_delay"), (20, 60)))
     return result
+
+
+class RunLock:
+    """A pid file for the duration of a run, so other processes can see it.
+
+    Anything that mutates the history (clearing drafts, for one) has to know a
+    run is in flight even when it was started from a terminal rather than the
+    web UI.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def __enter__(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def _dump_rows(cfg, rows, mode, total, done) -> None:
+    """This sheet's rows as JSON, for the console to read.
+
+    Purely additive - the dashboards, ledger and state file are untouched.
+    Written next to the report so it shares its lifecycle.
+    """
+    path = cfg.resolve(cfg.path("paths", "rows_json_path", default="output/run_rows.json"))
+    payload = {
+        "mode": mode, "total": total, "done": done,
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "rows": rows,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
 
 
 async def main_async(args) -> int:
@@ -431,6 +517,9 @@ async def main_async(args) -> int:
             log("aborted", logfile)
             return 1
 
+    run_lock = RunLock(cfg.resolve(cfg.path("paths", "lock_path", default="output/run.lock")))
+    run_lock.__enter__()
+
     results: list[dict] = []
     daily_cap = int(cfg.path("email", "daily_limit", default=50))
     site_timeout = float(cfg.path("run", "site_timeout_s", default=180))
@@ -499,6 +588,7 @@ async def main_async(args) -> int:
             # This sheet's own numbers - not the running total across every
             # sheet ever uploaded, which is what the overall dashboard is for.
             build_report(dup_skips + results, report_mode, report_path)
+            _dump_rows(cfg, dup_skips + results, report_mode, len(rows), n)
 
             # Burning through the rest of the sheet recording failures is worse
             # than stopping: the rows look attempted when they never were.
@@ -525,6 +615,7 @@ async def main_async(args) -> int:
     log(f"done - {len(results)} rows -> {out}", logfile)
     log(f"screenshots -> {ev.dir}", logfile)
 
+    _dump_rows(cfg, dup_skips + results, report_mode, len(rows), len(rows))
     report = build_report(dup_skips + results, report_mode, report_path)
     log(f"dashboard (this sheet) -> {report}", logfile)
     overall = build_report(list(state.data.values()), report_mode,
@@ -534,6 +625,8 @@ async def main_async(args) -> int:
     ledger = build_ledger(list(state.data.values()) + dup_skips,
                           cfg.resolve(cfg.path("paths", "ledger_path", default="output/contacted.xlsx")))
     log(f"contacted ledger -> {ledger}", logfile)
+
+    run_lock.__exit__()
 
     tally: dict[str, int] = {}
     for r in dup_skips + results:
@@ -560,3 +653,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\ninterrupted - progress saved in output/state.json, re-run to resume")
         sys.exit(130)
+    finally:
+        # A stale lock would block the UI from ever clearing drafts again.
+        try:
+            Path("output/run.lock").unlink(missing_ok=True)
+        except OSError:
+            pass
