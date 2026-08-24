@@ -28,6 +28,10 @@ class Mailer:
         self.port = int(cfg.path("email", "smtp_port", default=587))
         self._smtp: dict[str, smtplib.SMTP] = {}  # keyed by sender email, reused across sends
 
+    # Set by run.py to state.contacted_address. Left None, the mailer simply
+    # does not deduplicate - it never invents its own history.
+    already_contacted = None
+
     def preflight(self) -> str:
         if not self.cfg.path("email", "enabled", default=True):
             return "email disabled in config"
@@ -83,6 +87,16 @@ class Mailer:
         return msg
 
     def send(self, to_addr: str, subject: str, body: str, html: str, sender: dict) -> tuple[str, str]:
+        # Last line of defence, checked for every send regardless of which
+        # mailbox is sending: the lookup is keyed on the recipient, so an
+        # address written to by one sender is closed to all of them.
+        prior = self.already_contacted(to_addr) if self.already_contacted else None
+        if prior:
+            when = str(prior.get("timestamp", ""))[:10]
+            return "skipped_duplicate", (
+                f"{to_addr} was already emailed on {when} "
+                f"(via {prior.get('website', '?')}, sent by {prior.get('sender_email', '?')}) - not sending again")
+
         msg = self.build(to_addr, subject, body, html, sender)
         from_email = sender.get("email", "?")
         if not self.live:

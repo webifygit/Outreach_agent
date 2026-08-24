@@ -118,5 +118,6 @@ paths:
   results_path: "output/results.xlsx"
   state_path: "output/state.json"
   log_path: "output/run.log"
-  report_path: "output/report.html"
+  report_path: "output/report.html"   # this sheet only
+  report_all_path: "output/report_all.html"   # every sheet ever run
   ledger_path: "output/contacted.xlsx"   # forms / emails / skipped, one sheet each

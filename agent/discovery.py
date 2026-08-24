@@ -376,6 +376,43 @@ async def find_contact_links(page, base_url: str, limit: int) -> list[str]:
     return [u for _, u in scored[:limit]]
 
 
+# Titles are usually "Name | tagline" or "Name - Home". Cut at the separator
+# and drop the boilerplate half.
+TITLE_SPLIT_RE = re.compile(r"\s+[|–—\-:·]\s+")
+TITLE_JUNK_RE = re.compile(
+    r"^(home|welcome|index|untitled|home ?page|official (site|website))$", re.I)
+
+
+async def site_name(page) -> str:
+    """The company's own name for itself, properly spaced. "" if unusable.
+
+    A name derived from the domain runs the words together
+    ("goldencityfinance" -> "Goldencityfinance"), which reads badly in a
+    greeting. The site itself nearly always states the real name.
+    """
+    try:
+        raw = await asyncio.wait_for(page.evaluate(
+            """() => document.querySelector('meta[property="og:site_name"]')?.content
+                 || document.querySelector('meta[name="application-name"]')?.content
+                 || document.title || ''"""), timeout=EVAL_TIMEOUT_S)
+    except Exception:
+        return ""
+
+    name = " ".join(str(raw or "").split())
+    if not name:
+        return ""
+    # keep the longest leading chunk that still looks like a name
+    parts = [p.strip() for p in TITLE_SPLIT_RE.split(name) if p.strip()]
+    if parts:
+        name = parts[0]
+    name = name.strip(" .,|-–—")
+    if not name or len(name) > 60 or TITLE_JUNK_RE.match(name):
+        return ""
+    if not re.search(r"[A-Za-z]{2}", name):
+        return ""
+    return name
+
+
 async def page_summary(page, max_chars: int = 500) -> str:
     """Title + meta description + first heading - context for the local LLM hook."""
     try:

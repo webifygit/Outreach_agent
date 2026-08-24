@@ -18,10 +18,12 @@ already writes after every site.
 from __future__ import annotations
 
 import os
+import json
 import secrets
 import subprocess
 import sys
 import threading
+from html import escape as html_escape
 from datetime import datetime
 from pathlib import Path
 
@@ -48,6 +50,7 @@ if AGENT_HOST != "127.0.0.1" and not AGENT_PASSWORD:
 
 cfg = Config.load(default_config_path(ROOT))
 REPORT_PATH = cfg.resolve(cfg.path("paths", "report_path", default="output/report.html"))
+STATE_FILE = cfg.resolve(cfg.path("paths", "state_path", default="output/state.json"))
 EVIDENCE_DIR = cfg.resolve(cfg.path("paths", "evidence_dir", default="evidence"))
 LAUNCH_LOG = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log")).with_name("webapp_launch.log")
 
@@ -144,12 +147,43 @@ def _last_problem() -> str:
     return ""
 
 
+def _last_input() -> Path | None:
+    """The sheet a "go live" would re-run.
+
+    Falls back to the newest upload on disk: the in-memory record is lost when
+    the service restarts, and the button should not disappear just because the
+    UI was restarted between the dry run and the decision to send.
+    """
+    path = STATE.get("input_path")
+    if path and Path(path).exists():
+        return Path(path)
+    try:
+        uploads = sorted(UPLOAD_DIR.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for candidate in uploads:
+        if candidate.suffix.lower() in ALLOWED_EXT:
+            return candidate
+    return None
+
+
+def _dry_run_count() -> int:
+    """Rows filled but never submitted - what "go live" would actually act on."""
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    return sum(1 for r in data.values() if r.get("status") == "dry_run")
+
+
 def _status() -> dict:
     proc = STATE["proc"]
     running = proc is not None and proc.poll() is None
     code = None if proc is None else proc.poll()
     return {
         "problem": _last_problem() if (code not in (0, None)) else "",
+        "dry_runs": _dry_run_count(),
+        "can_go_live": _last_input() is not None and not running,
         "running": running,
         "returncode": None if proc is None else proc.poll(),
         "input": STATE["input"],
@@ -197,22 +231,47 @@ def start():
         headless = bool(data.get("headless", True))
         limit = int(data.get("limit") or 0)
 
-        argv = [sys.executable, "run.py", "--input", str(input_path), "--yes"]
-        if live:
-            argv.append("--live")
-        if not headless:
-            argv.append("--no-headless")
-        if limit:
-            argv += ["--limit", str(limit)]
+        return start_run(input_path, live, headless, limit)
 
-        LAUNCH_LOG.parent.mkdir(parents=True, exist_ok=True)
-        log_fh = open(LAUNCH_LOG, "a", encoding="utf-8")
-        log_fh.write(f"\n--- launched {datetime.now():%Y-%m-%d %H:%M:%S} :: {' '.join(argv)} ---\n")
-        log_fh.flush()
 
-        proc = subprocess.Popen(argv, cwd=str(ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
-        STATE.update(proc=proc, input=input_path.name, live=live, started_at=datetime.now().isoformat(timespec="seconds"))
-        return jsonify(_status())
+def start_run(input_path: Path, live: bool, headless: bool, limit: int):
+    """Launch run.py. Caller owns the "already running" check."""
+    argv = [sys.executable, "run.py", "--input", str(input_path), "--yes"]
+    if live:
+        argv.append("--live")
+    if not headless:
+        argv.append("--no-headless")
+    if limit:
+        argv += ["--limit", str(limit)]
+
+    LAUNCH_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(LAUNCH_LOG, "a", encoding="utf-8")
+    log_fh.write(f"\n--- launched {datetime.now():%Y-%m-%d %H:%M:%S} :: {' '.join(argv)} ---\n")
+    log_fh.flush()
+
+    proc = subprocess.Popen(argv, cwd=str(ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
+    STATE.update(proc=proc, input=input_path.name, input_path=str(input_path),
+                 live=live, started_at=datetime.now().isoformat(timespec="seconds"))
+    return jsonify(_status())
+
+
+@app.post("/go-live")
+def go_live():
+    """Re-run the sheet from the last run with live mode on.
+
+    Dry-run rows are not treated as completed attempts, so they are picked up
+    again; anything already sent or submitted is skipped by the duplicate
+    check, so this cannot re-contact someone.
+    """
+    with _lock:
+        proc = STATE["proc"]
+        if proc is not None and proc.poll() is None:
+            return jsonify(error="a run is already in progress"), 409
+        path = _last_input()
+        if path is None:
+            return jsonify(error="no previous run to promote - upload a sheet and run it first"), 400
+
+    return start_run(path, live=True, headless=True, limit=0)
 
 
 @app.post("/stop")
@@ -236,6 +295,178 @@ def files(relpath):
     if not any(target == r or target.is_relative_to(r) for r in allowed_roots):
         return "forbidden", 403
     return send_from_directory(target.parent, target.name)
+
+
+CONTACTED_CSS = """
+  body { margin:0; background:#f8f9fa; color:#111827;
+         font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  @media (prefers-color-scheme: dark) { body { background:#0f172a; color:#e2e8f0; } }
+  .wrap { max-width:1100px; margin:0 auto; padding:28px 20px 64px; }
+  a { color:#2563eb; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  .sub { color:#6b7280; margin:0 0 22px; font-size:14px; }
+  .tabs { display:flex; gap:6px; border-bottom:1px solid rgba(128,128,128,.28); flex-wrap:wrap; }
+  .tab { padding:10px 16px; border:1px solid transparent; border-bottom:none; cursor:pointer;
+         border-radius:8px 8px 0 0; font:500 14px system-ui,sans-serif; color:#6b7280; background:none; }
+  .tab[aria-selected="true"] { background:#fff; color:#111827; border-color:rgba(128,128,128,.28); }
+  @media (prefers-color-scheme: dark) { .tab[aria-selected="true"] { background:#1e293b; color:#f8fafc; } }
+  .panel { background:#fff; border:1px solid rgba(128,128,128,.28); border-top:none;
+           border-radius:0 0 10px 10px; overflow-x:auto; }
+  @media (prefers-color-scheme: dark) { .panel { background:#1e293b; } }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; }
+  th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+       color:#6b7280; padding:12px 14px; border-bottom:1px solid rgba(128,128,128,.22); white-space:nowrap; }
+  td { padding:10px 14px; border-bottom:1px solid rgba(128,128,128,.13); vertical-align:top; }
+  tr:last-child td { border-bottom:none; }
+  .mono { font-variant-numeric:tabular-nums; color:#6b7280; white-space:nowrap; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11.5px; font-weight:600; }
+  .ok { background:#dcfce7; color:#166534; }
+  .warn { background:#fef3c7; color:#92400e; }
+  @media (prefers-color-scheme: dark) { .ok{background:#14532d;color:#bbf7d0;} .warn{background:#78350f;color:#fde68a;} }
+  .empty { padding:36px 16px; text-align:center; color:#6b7280; }
+  .count { font-weight:400; color:#9ca3af; }
+  .bar { display:flex; justify-content:space-between; align-items:center; gap:12px;
+         margin-bottom:18px; flex-wrap:wrap; }
+  .btn { display:inline-block; padding:8px 14px; border:1px solid rgba(128,128,128,.3);
+         border-radius:8px; text-decoration:none; font-size:13.5px; }
+"""
+
+
+def _contacted_rows():
+    """Everything the agent actually reached, split by how, newest first."""
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return [], []
+    reached = [r for r in data.values() if r.get("status") in ("sent", "success", "uncertain")]
+    reached.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
+    return ([r for r in reached if r.get("method") == "email"],
+            [r for r in reached if r.get("method") == "form"])
+
+
+def _esc(value) -> str:
+    return html_escape(str(value or ""))
+
+
+def _when(row) -> str:
+    return _esc(str(row.get("timestamp"))[:16].replace("T", " "))
+
+
+@app.get("/overall")
+def overall():
+    """Totals across every sheet ever run, kept apart from the per-sheet view."""
+    path = cfg.resolve(cfg.path("paths", "report_all_path", default="output/report_all.html"))
+    if not path.exists():
+        body = ('<div class="empty" style="padding:60px 20px;text-align:center;color:#6b7280;">'
+                'No overall dashboard yet - it is written when a run finishes.</div>')
+    else:
+        body = ('<iframe src="/files/output/report_all.html" '
+                'style="width:100%;height:calc(100vh - 150px);border:1px solid rgba(128,128,128,.28);'
+                'border-radius:10px;background:#fff;"></iframe>')
+    return OVERALL_HTML.replace("{css}", CONTACTED_CSS).replace("{body}", body)
+
+
+OVERALL_HTML = """<!doctype html>
+<meta charset="utf-8"><title>Overall totals - outreach agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{css}</style>
+<div class="wrap" style="max-width:1240px;">
+  <div class="bar">
+    <div>
+      <h1>Overall totals</h1>
+      <p class="sub">Every sheet ever run, combined. The dashboard on the run page shows only the sheet you just uploaded.</p>
+    </div>
+    <div>
+      <a class="btn" href="/contacted">Already contacted</a>
+      <a class="btn" href="/">&larr; Back to runs</a>
+    </div>
+  </div>
+  {body}
+</div>
+"""
+
+
+@app.get("/contacted")
+def contacted():
+    mails, forms = _contacted_rows()
+
+    if mails:
+        mail_rows = "".join(
+            '<tr><td><strong>{}</strong></td><td>{}<br><a href="{}" target="_blank" rel="noopener">{}</a></td>'
+            '<td>{}</td><td><span class="pill ok">{}</span></td><td class="mono">{}</td></tr>'.format(
+                _esc(r.get("email_used")), _esc(r.get("company_name")),
+                _esc(r.get("website")), _esc(r.get("website")),
+                _esc(r.get("sender_email")), _esc(r.get("status")), _when(r))
+            for r in mails)
+    else:
+        mail_rows = '<tr><td colspan="5"><div class="empty">No emails sent yet.</div></td></tr>'
+
+    if forms:
+        form_rows = "".join(
+            '<tr><td><strong>{}</strong><br><a href="{}" target="_blank" rel="noopener">{}</a></td>'
+            '<td><a href="{}" target="_blank" rel="noopener">{}</a></td><td>{}</td>'
+            '<td><span class="pill {}">{}</span></td><td class="mono">{}</td></tr>'.format(
+                _esc(r.get("company_name")), _esc(r.get("website")), _esc(r.get("website")),
+                _esc(r.get("contact_page") or r.get("website")),
+                _esc(r.get("contact_page") or r.get("website")),
+                _esc(r.get("sender")),
+                "ok" if r.get("status") == "success" else "warn",
+                _esc(r.get("status")), _when(r))
+            for r in forms)
+    else:
+        form_rows = '<tr><td colspan="5"><div class="empty">No contact forms submitted yet.</div></td></tr>'
+
+    # Plain substitution, not str.format: the page carries a <script> block
+    # whose braces would be read as format fields.
+    page = CONTACTED_HTML
+    for token, value in (("{css}", CONTACTED_CSS), ("{n_mail}", str(len(mails))),
+                         ("{n_form}", str(len(forms))), ("{mail_rows}", mail_rows),
+                         ("{form_rows}", form_rows)):
+        page = page.replace(token, value)
+    return page
+
+
+CONTACTED_HTML = """<!doctype html>
+<meta charset="utf-8"><title>Already contacted - outreach agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{css}</style>
+<div class="wrap">
+  <div class="bar">
+    <div>
+      <h1>Already contacted</h1>
+      <p class="sub">Everyone the agent has reached. These are skipped automatically on future runs.</p>
+    </div>
+    <a class="btn" href="/">&larr; Back to runs</a>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" id="t-mail" aria-selected="true" onclick="pick('mail')">
+      Email addresses <span class="count">({n_mail})</span></button>
+    <button class="tab" role="tab" id="t-form" aria-selected="false" onclick="pick('form')">
+      Contact forms <span class="count">({n_form})</span></button>
+  </div>
+
+  <div class="panel" id="p-mail">
+    <table><thead><tr><th>Email address</th><th>Company / site</th><th>Sent from</th>
+      <th>Status</th><th>When</th></tr></thead><tbody>{mail_rows}</tbody></table>
+  </div>
+  <div class="panel" id="p-form" hidden>
+    <table><thead><tr><th>Company / site</th><th>Form page</th><th>Filled as</th>
+      <th>Status</th><th>When</th></tr></thead><tbody>{form_rows}</tbody></table>
+  </div>
+</div>
+<script>
+  function pick(which) {
+    for (const key of ['mail', 'form']) {
+      const on = key === which;
+      document.getElementById('p-' + key).hidden = !on;
+      document.getElementById('t-' + key).setAttribute('aria-selected', on);
+    }
+    try { localStorage.setItem('contactedTab', which); } catch (e) {}
+  }
+  try { const t = localStorage.getItem('contactedTab'); if (t) pick(t); } catch (e) {}
+</script>
+"""
 
 
 @app.get("/")
@@ -418,7 +649,9 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <h1>Outreach agent</h1>
-<p class="sub">Upload a leads spreadsheet and start a run - the dashboard on the right updates live.</p>
+<p class="sub">Upload a leads spreadsheet and start a run - the dashboard on the right updates live.
+  &nbsp;<a href="/contacted" style="color:var(--accent);font-weight:500;">Already contacted &rarr;</a>
+  &nbsp;&middot;&nbsp;<a href="/overall" style="color:var(--accent);font-weight:500;">Overall totals &rarr;</a></p>
 
 <div class="layout">
   <div class="card">
@@ -444,6 +677,7 @@ INDEX_HTML = r"""<!doctype html>
     </fieldset>
 
     <button class="btn-primary" id="startBtn" disabled>Start run</button>
+    <button id="golive" hidden style="margin-top:10px;width:100%;">Submit dry runs live</button>
     <button class="btn-stop" id="stopBtn" hidden>Stop run</button>
 
     <div style="margin-top:16px;">
@@ -582,9 +816,18 @@ INDEX_HTML = r"""<!doctype html>
       setPill('running', 'Running' + (s.input ? ' - ' + s.input : ''));
       stopBtn.hidden = false;
       startBtn.disabled = true;
+      golive.hidden = true;
     } else {
       stopBtn.hidden = true;
       startBtn.disabled = !uploadedPath;
+      if (s.can_go_live && s.dry_runs > 0) {
+        golive.hidden = false;
+        golive.disabled = false;
+        golive.dataset.count = s.dry_runs;
+        golive.textContent = 'Submit ' + s.dry_runs + ' dry run' + (s.dry_runs === 1 ? '' : 's') + ' live';
+      } else {
+        golive.hidden = true;
+      }
       if (s.returncode === 0) setPill('done', 'Finished');
       else if (s.returncode) {
         setPill('error', s.problem || ('Stopped (exit ' + s.returncode + ')'));
@@ -600,6 +843,19 @@ INDEX_HTML = r"""<!doctype html>
     poller = setInterval(poll, 3000);
     poll();
   }
+
+  const golive = document.getElementById('golive');
+  golive.addEventListener('click', async () => {
+    const n = golive.dataset.count || '0';
+    if (!confirm('Submit ' + n + ' dry-run site(s) for real?\n\n' +
+                 'Contact forms will be submitted and emails sent. Anyone already ' +
+                 'contacted is skipped automatically. This cannot be undone.')) return;
+    golive.disabled = true;
+    const res = await fetch('/go-live', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { alert(data.error); golive.disabled = false; return; }
+    startPolling();
+  });
 
   poll(); // pick up an already-running process on page load
 </script>

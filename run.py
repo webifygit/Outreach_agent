@@ -34,7 +34,8 @@ from agent.report import build_report
 from agent.senders import pick_sender
 from agent.sheet import load_rows, write_results
 from agent.state import State, norm_site
-from agent.templating import context_for, make_env, render_file, render_string
+from agent.templating import (context_for, greeting_for, make_env, presentable_company,
+                              render_file, render_string)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -187,6 +188,17 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
         result.update(method="none", status="unreachable", detail=err)
         await page.close()
         return result
+
+    # A name split off the domain runs the words together
+    # ("secondliftingequipment"), which reads badly in a greeting. The site
+    # itself nearly always states its real name, so ask the page first.
+    if not row.get("company_from_sheet", False):
+        scraped = await discovery.site_name(page)
+        if scraped and presentable_company(scraped):
+            ctx["company_name"] = scraped
+            result["company_name"] = scraped
+    ctx["greeting_name"] = greeting_for(ctx.get("company_name", ""),
+                                        ctx.get("contact_first_name", ""))
 
     if cfg.path("llm", "enabled", default=False) and cfg.path("llm", "use_site_content", default=True):
         site_summary = await discovery.page_summary(page)
@@ -403,6 +415,8 @@ async def main_async(args) -> int:
 
 
     mailer = Mailer(cfg, cfg.live)
+    if cfg.path("run", "skip_already_contacted", default=True):
+        mailer.already_contacted = state.contacted_address
     warn = mailer.preflight()
     if warn:
         log(f"WARNING (email fallback): {warn}", logfile)
@@ -482,7 +496,9 @@ async def main_async(args) -> int:
             state.record(row["website"], res)
             since_recycle += 1
             log(f"    -> {res['method'] or '-'} / {res['status']} :: {res['detail'][:110]}", logfile)
-            build_report(list(state.data.values()) + dup_skips, report_mode, report_path)
+            # This sheet's own numbers - not the running total across every
+            # sheet ever uploaded, which is what the overall dashboard is for.
+            build_report(dup_skips + results, report_mode, report_path)
 
             # Burning through the rest of the sheet recording failures is worse
             # than stopping: the rows look attempted when they never were.
@@ -509,8 +525,12 @@ async def main_async(args) -> int:
     log(f"done - {len(results)} rows -> {out}", logfile)
     log(f"screenshots -> {ev.dir}", logfile)
 
-    report = build_report(list(state.data.values()) + dup_skips, report_mode, report_path)
-    log(f"dashboard -> {report}", logfile)
+    report = build_report(dup_skips + results, report_mode, report_path)
+    log(f"dashboard (this sheet) -> {report}", logfile)
+    overall = build_report(list(state.data.values()), report_mode,
+                           cfg.resolve(cfg.path("paths", "report_all_path",
+                                                default="output/report_all.html")))
+    log(f"dashboard (all sheets) -> {overall}", logfile)
     ledger = build_ledger(list(state.data.values()) + dup_skips,
                           cfg.resolve(cfg.path("paths", "ledger_path", default="output/contacted.xlsx")))
     log(f"contacted ledger -> {ledger}", logfile)
