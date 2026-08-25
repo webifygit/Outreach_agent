@@ -493,7 +493,17 @@ async def main_async(args) -> int:
                 log(f"    and {len(dup_skips) - 8} more", logfile)
         rows = fresh
 
-    if cfg.path("run", "resume", default=True) and not args.no_resume:
+    if getattr(args, "continue_batch", False):
+        # Picking up a batch that stopped: anything with a record was already
+        # visited, whatever the outcome, so start from the first row that has
+        # none. Matched on the normalised host so a www/https difference in the
+        # sheet does not look like a new site.
+        seen_hosts = {norm_site(u, scope) for u in state.data}
+        pending = [r for r in rows if norm_site(r["website"], scope) not in seen_hosts]
+        log(f"continuing batch: {len(rows) - len(pending)} row(s) already attempted, "
+            f"{len(pending)} to go", logfile)
+        rows = pending
+    elif cfg.path("run", "resume", default=True) and not args.no_resume:
         pending = [r for r in rows if not state.is_done(r["website"])]
         if len(pending) < len(rows):
             log(f"resume: skipping {len(rows) - len(pending)} already-processed rows", logfile)
@@ -643,6 +653,9 @@ def parse_args(argv=None):
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--no-headless", action="store_true", help="show the browser window")
     p.add_argument("--no-resume", action="store_true", help="reprocess rows already done")
+    p.add_argument("--continue-batch", action="store_true",
+                   help="carry on where a stopped run left off: skip every row already "
+                        "attempted, dry runs included")
     p.add_argument("--yes", action="store_true", help="skip the live-mode confirmation prompt")
     return p.parse_args(argv)
 

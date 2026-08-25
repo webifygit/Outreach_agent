@@ -255,7 +255,8 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .b-stop  { background: rgba(244,63,94,.12); border-color: rgba(244,63,94,.4); color: #FDA4AF; }
 .b-stop:hover:not(:disabled) { background: rgba(244,63,94,.2); }
 .b-go    { background: rgba(16,185,129,.13); border-color: rgba(16,185,129,.42); color: #6EE7B7; }
-.b-clear { background: rgba(245,158,11,.10); border-color: rgba(245,158,11,.38); color: #FCD34D; }
+  .b-resume { background: rgba(6,182,212,.13); border-color: rgba(6,182,212,.42); color: #67E8F9; }
+  .b-clear { background: rgba(245,158,11,.10); border-color: rgba(245,158,11,.38); color: #FCD34D; }
 .inline-row { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
 .inline-row .count {
   flex: none; min-width: 44px; text-align: center; padding: 9px 0; border-radius: 10px;
@@ -435,6 +436,10 @@ td .muted { color: var(--ink-3); }
     background: linear-gradient(135deg, #059669, #0D9488); color: #fff;
     border-color: transparent; box-shadow: 0 6px 18px rgba(5,150,105,.28);
   }
+  :root[data-theme="light"] .b-resume {
+    background: linear-gradient(135deg, #0891B2, #4F46E5); color: #fff;
+    border-color: transparent; box-shadow: 0 6px 18px rgba(8,145,178,.28);
+  }
   :root[data-theme="light"] .b-clear {
     background: #FEF3C7; color: #92400E; border-color: #FCD34D; font-weight: 600;
   }
@@ -558,6 +563,10 @@ td .muted { color: var(--ink-3); }
         <div class="btns">
           <button class="b-start" id="startBtn" disabled>▶ Start</button>
           <button class="b-stop" id="stopBtn" disabled>■ Stop</button>
+        </div>
+        <div class="inline-row" id="resumeRow" hidden>
+          <span class="count" id="resumeCount">0</span>
+          <button class="b-resume" id="resumeBtn">Resume where it stopped</button>
         </div>
         <div class="inline-row" id="goliveRow" hidden>
           <span class="count" id="goliveCount">0</span>
@@ -814,6 +823,11 @@ async function refresh() {
   stopBtn.disabled = !running;
   startBtn.disabled = running || !uploadedPath;
 
+  const canResume = !running && (s.remaining > 0) && !!s.can_go_live;
+  $('resumeRow').hidden = !canResume;
+  $('resumeCount').textContent = s.remaining ?? 0;
+  if (canResume) $('resumeBtn').disabled = false;
+
   const showGo = !!s.can_go_live && (s.dry_runs > 0) && !running;
   $('goliveRow').hidden = !showGo;
   $('goliveCount').textContent = s.dry_runs ?? 0;
@@ -924,6 +938,22 @@ stopBtn.addEventListener('click', async () => {
   stopBtn.textContent = '■ Stop';
   toast('Run stopped', 'The agent was asked to stop');
   refresh();
+});
+
+$('resumeBtn').addEventListener('click', async () => {
+  const n = $('resumeCount').textContent;
+  const btn = $('resumeBtn');
+  btn.disabled = true;
+  btn.innerHTML = 'Resuming <span class="dots"><i></i><i></i><i></i></span>';
+  const data = await post('/resume');
+  if (data.error) {
+    toast('Could not resume', data.error, 'err');
+    btn.disabled = false; btn.textContent = 'Resume where it stopped';
+    return;
+  }
+  btn.textContent = 'Resume where it stopped';
+  toast('Resumed', n + ' site(s) still to process', 'ok');
+  startPolling();
 });
 
 $('goliveBtn').addEventListener('click', async () => {

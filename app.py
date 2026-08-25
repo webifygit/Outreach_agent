@@ -181,15 +181,77 @@ def _external_run_active() -> bool:
         pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return False
+    if _pid_alive(pid):
+        return True
     try:
-        os.kill(pid, 0)          # signal 0: existence check, changes nothing
-    except (OSError, ProcessLookupError):
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is this process still running? Never touches it.
+
+    os.kill(pid, 0) is the usual idiom, but on Windows it is the wrong tool:
+    os.kill maps to TerminateProcess for any signal other than the console
+    events, and against a pid that has already gone it raises in a way that
+    escapes an `except OSError` - which took the whole status endpoint down
+    with a 500. OpenProcess only asks a question.
+    """
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
         try:
-            LOCK_FILE.unlink(missing_ok=True)
-        except OSError:
-            pass
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except Exception:
         return False
     return True
+
+
+_REMAIN_CACHE: dict = {"key": None, "value": 0}
+
+
+def _remaining_count() -> int:
+    """Rows of the last sheet with no record yet - what Resume would work on.
+
+    Cached against the sheet and the history file so the status poll is not
+    re-parsing a spreadsheet every few seconds.
+    """
+    path = _last_input()
+    if path is None:
+        return 0
+    try:
+        key = (str(path), path.stat().st_mtime, STATE_FILE.stat().st_mtime
+               if STATE_FILE.exists() else 0)
+    except OSError:
+        return 0
+    if _REMAIN_CACHE["key"] == key:
+        return _REMAIN_CACHE["value"]
+
+    try:
+        from agent.sheet import load_rows
+        from agent.state import norm_site
+        rows, _ = load_rows(path)
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+        scope = str(cfg.path("run", "dedupe_scope", default="host"))
+        seen = {norm_site(u, scope) for u in data}
+        value = sum(1 for r in rows if norm_site(r["website"], scope) not in seen)
+    except Exception:
+        value = 0
+    _REMAIN_CACHE.update(key=key, value=value)
+    return value
 
 
 def _dry_run_count() -> int:
@@ -208,6 +270,7 @@ def _status() -> dict:
     return {
         "problem": _last_problem() if (code not in (0, None)) else "",
         "dry_runs": _dry_run_count(),
+        "remaining": _remaining_count(),
         "restarts": STATE.get("restarts", 0),
         "can_go_live": _last_input() is not None and not running,
         "running": running,
@@ -309,9 +372,12 @@ def _supervise(argv, log_fh):
             pass
 
 
-def start_run(input_path: Path, live: bool, headless: bool, limit: int):
+def start_run(input_path: Path, live: bool, headless: bool, limit: int,
+              continue_batch: bool = False):
     """Launch run.py under supervision. Caller owns the "already running" check."""
     argv = [sys.executable, "run.py", "--input", str(input_path), "--yes"]
+    if continue_batch:
+        argv.append("--continue-batch")
     if live:
         argv.append("--live")
     if not headless:
@@ -404,6 +470,25 @@ def clear_drafts():
     return jsonify(removed=len(drafts), kept=len(kept), contacted=contacted, backup=backup.name)
 
 
+@app.post("/resume")
+def resume():
+    """Carry on with the last sheet, skipping every row already attempted.
+
+    Live mode is taken from the run being continued, so resuming a live batch
+    stays live and resuming a dry run stays a dry run.
+    """
+    with _lock:
+        proc = STATE["proc"]
+        if (proc is not None and proc.poll() is None) or _external_run_active():
+            return jsonify(error="a run is already in progress"), 409
+        path = _last_input()
+        if path is None:
+            return jsonify(error="nothing to resume - upload a sheet and run it first"), 400
+        live = bool(STATE.get("live"))
+
+    return start_run(path, live=live, headless=True, limit=0, continue_batch=True)
+
+
 @app.post("/stop")
 def stop():
     STATE["stopped_by_user"] = True
@@ -429,37 +514,66 @@ def files(relpath):
 
 
 CONTACTED_CSS = """
-  body { margin:0; background:#f8f9fa; color:#111827;
-         font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
-  @media (prefers-color-scheme: dark) { body { background:#0f172a; color:#e2e8f0; } }
+  /* Dark by default, matching the console. The console's toggle wins over the
+     operating system, so this keys off data-theme rather than a media query. */
+  :root {
+    --bg: #05070F; --surface: rgba(17,22,41,.72); --raised: rgba(23,29,52,.6);
+    --ink: #E8ECF8; --ink-2: #97A2C0; --ink-3: #5F6B8C;
+    --edge: rgba(129,140,248,.16); --accent: #818CF8;
+    --ok-bg: rgba(16,185,129,.14); --ok-fg: #6EE7B7; --ok-br: rgba(16,185,129,.34);
+    --warn-bg: rgba(245,158,11,.14); --warn-fg: #FCD34D; --warn-br: rgba(245,158,11,.34);
+  }
+  :root[data-theme="light"] {
+    --bg: #F4F6FC; --surface: #FFFFFF; --raised: #F7F9FE;
+    --ink: #0F1730; --ink-2: #4A5578; --ink-3: #8A93B0;
+    --edge: rgba(15,23,42,.10); --accent: #4F46E5;
+    --ok-bg: #D1FAE5; --ok-fg: #065F46; --ok-br: #6EE7B7;
+    --warn-bg: #FEF3C7; --warn-fg: #92400E; --warn-br: #FCD34D;
+  }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.55 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
   .wrap { max-width:1100px; margin:0 auto; padding:28px 20px 64px; }
-  a { color:#2563eb; }
+  a { color:var(--accent); }
   h1 { font-size:24px; margin:0 0 4px; }
-  .sub { color:#6b7280; margin:0 0 22px; font-size:14px; }
-  .tabs { display:flex; gap:6px; border-bottom:1px solid rgba(128,128,128,.28); flex-wrap:wrap; }
+  .sub { color:var(--ink-3); margin:0 0 22px; font-size:14px; }
+  .tabs { display:flex; gap:6px; border-bottom:1px solid var(--edge); flex-wrap:wrap; }
   .tab { padding:10px 16px; border:1px solid transparent; border-bottom:none; cursor:pointer;
-         border-radius:8px 8px 0 0; font:500 14px system-ui,sans-serif; color:#6b7280; background:none; }
-  .tab[aria-selected="true"] { background:#fff; color:#111827; border-color:rgba(128,128,128,.28); }
-  @media (prefers-color-scheme: dark) { .tab[aria-selected="true"] { background:#1e293b; color:#f8fafc; } }
-  .panel { background:#fff; border:1px solid rgba(128,128,128,.28); border-top:none;
-           border-radius:0 0 10px 10px; overflow-x:auto; }
-  @media (prefers-color-scheme: dark) { .panel { background:#1e293b; } }
+         border-radius:8px 8px 0 0; font:500 14px Inter, system-ui, sans-serif;
+         color:var(--ink-3); background:none; transition:color .2s, background .2s; }
+  .tab:hover { color:var(--ink); }
+  .tab[aria-selected="true"] { background:var(--surface); color:var(--ink); border-color:var(--edge); }
+  .panel { background:var(--surface); border:1px solid var(--edge); border-top:none;
+           border-radius:0 0 12px 12px; overflow-x:auto; backdrop-filter:blur(12px); }
   table { border-collapse:collapse; width:100%; font-size:13.5px; }
-  th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
-       color:#6b7280; padding:12px 14px; border-bottom:1px solid rgba(128,128,128,.22); white-space:nowrap; }
-  td { padding:10px 14px; border-bottom:1px solid rgba(128,128,128,.13); vertical-align:top; }
+  th { text-align:left; font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+       color:var(--ink-3); padding:12px 14px; border-bottom:1px solid var(--edge); white-space:nowrap; }
+  td { padding:10px 14px; border-bottom:1px solid var(--edge); vertical-align:top; }
   tr:last-child td { border-bottom:none; }
-  .mono { font-variant-numeric:tabular-nums; color:#6b7280; white-space:nowrap; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11.5px; font-weight:600; }
-  .ok { background:#dcfce7; color:#166534; }
-  .warn { background:#fef3c7; color:#92400e; }
-  @media (prefers-color-scheme: dark) { .ok{background:#14532d;color:#bbf7d0;} .warn{background:#78350f;color:#fde68a;} }
-  .empty { padding:36px 16px; text-align:center; color:#6b7280; }
-  .count { font-weight:400; color:#9ca3af; }
+  tbody tr { transition:background .2s ease; }
+  tbody tr:hover { background:rgba(129,140,248,.06); }
+  .mono { font-variant-numeric:tabular-nums; color:var(--ink-3); white-space:nowrap; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11.5px; font-weight:600;
+          border:1px solid transparent; }
+  .ok { background:var(--ok-bg); color:var(--ok-fg); border-color:var(--ok-br); }
+  .warn { background:var(--warn-bg); color:var(--warn-fg); border-color:var(--warn-br); }
+  .empty { padding:36px 16px; text-align:center; color:var(--ink-3); }
+  .count { font-weight:400; color:var(--ink-3); }
   .bar { display:flex; justify-content:space-between; align-items:center; gap:12px;
          margin-bottom:18px; flex-wrap:wrap; }
-  .btn { display:inline-block; padding:8px 14px; border:1px solid rgba(128,128,128,.3);
-         border-radius:8px; text-decoration:none; font-size:13.5px; }
+  .btn { display:inline-block; padding:8px 14px; border:1px solid var(--edge); background:var(--surface);
+         border-radius:9px; text-decoration:none; font-size:13.5px; color:var(--ink);
+         transition:transform .16s ease, border-color .16s ease; }
+  .btn:hover { transform:translateY(-1px); border-color:var(--accent); }
+  .thumbs { display:flex; gap:8px; }
+  .thumb { display:block; width:104px; border:1px solid var(--edge); border-radius:8px;
+           overflow:hidden; text-decoration:none; background:var(--raised);
+           transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+  .thumb:hover { transform:scale(1.03); border-color:var(--accent);
+                 box-shadow:0 8px 22px rgba(79,70,229,.22); }
+  .thumb img { display:block; width:100%; height:64px; object-fit:cover; object-position:top; }
+  .thumb span { display:block; padding:3px 6px; font-size:10px; letter-spacing:.05em;
+                text-transform:uppercase; color:var(--ink-3); }
+  .thumb.txt { display:grid; place-items:center; height:64px; }
 """
 
 
@@ -477,6 +591,46 @@ def _contacted_rows():
 
 def _esc(value) -> str:
     return html_escape(str(value or ""))
+
+
+def _shot_url(path) -> str:
+    """/files/ URL for an evidence file, or "" if it is gone.
+
+    Runs are re-run and evidence folders get cleaned, so a recorded path is not
+    a promise the file still exists.
+    """
+    if not path:
+        return ""
+    try:
+        p = Path(path)
+        if not p.exists():
+            return ""
+        rel = p.resolve().relative_to(ROOT.resolve())
+    except (ValueError, OSError):
+        return ""
+    return "/files/" + str(rel).replace("\\", "/")
+
+
+def _thumbs(row) -> str:
+    """Before/after thumbnails for one row."""
+    pairs = [("filled", _shot_url(row.get("screenshot_before"))),
+             ("submitted", _shot_url(row.get("screenshot_after")))]
+    cells = []
+    for label, url in pairs:
+        if not url:
+            continue
+        if url.lower().endswith(".png"):
+            cells.append(
+                f'<a class="thumb" href="{_esc(url)}" target="_blank" rel="noopener" '
+                f'title="{_esc(label)}"><img src="{_esc(url)}" alt="{_esc(label)}" loading="lazy">'
+                f'<span>{_esc(label)}</span></a>')
+        else:
+            cells.append(f'<a class="thumb txt" href="{_esc(url)}" target="_blank" '
+                         f'rel="noopener"><span>{_esc(label)} (text)</span></a>')
+    if not cells:
+        return '<span class="mono">-</span>'
+    return '<div class="thumbs">' + "".join(cells) + '</div>'
+
 
 
 def _when(row) -> str:
@@ -566,6 +720,18 @@ OVERALL_HTML = """<!doctype html>
 <meta charset="utf-8"><title>Overall totals - outreach agent</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{css}</style>
+<script>
+  /* The console stores the chosen theme; every page here follows it. Runs
+     before paint so there is no flash of the wrong palette. */
+  (function () {
+    try {
+      var t = localStorage.getItem('webifyTheme');
+      document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
+    } catch (e) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  })();
+</script>
 <div class="wrap" style="max-width:1240px;">
   <div class="bar">
     <div>
@@ -589,10 +755,10 @@ def contacted():
     if mails:
         mail_rows = "".join(
             '<tr><td><strong>{}</strong></td><td>{}<br><a href="{}" target="_blank" rel="noopener">{}</a></td>'
-            '<td>{}</td><td><span class="pill ok">{}</span></td><td class="mono">{}</td></tr>'.format(
+            '<td>{}</td><td><span class="pill ok">{}</span></td><td>{}</td><td class="mono">{}</td></tr>'.format(
                 _esc(r.get("email_used")), _esc(r.get("company_name")),
                 _esc(r.get("website")), _esc(r.get("website")),
-                _esc(r.get("sender_email")), _esc(r.get("status")), _when(r))
+                _esc(r.get("sender_email")), _esc(r.get("status")), _thumbs(r), _when(r))
             for r in mails)
     else:
         mail_rows = '<tr><td colspan="5"><div class="empty">No emails sent yet.</div></td></tr>'
@@ -601,13 +767,13 @@ def contacted():
         form_rows = "".join(
             '<tr><td><strong>{}</strong><br><a href="{}" target="_blank" rel="noopener">{}</a></td>'
             '<td><a href="{}" target="_blank" rel="noopener">{}</a></td><td>{}</td>'
-            '<td><span class="pill {}">{}</span></td><td class="mono">{}</td></tr>'.format(
+            '<td><span class="pill {}">{}</span></td><td>{}</td><td class="mono">{}</td></tr>'.format(
                 _esc(r.get("company_name")), _esc(r.get("website")), _esc(r.get("website")),
                 _esc(r.get("contact_page") or r.get("website")),
                 _esc(r.get("contact_page") or r.get("website")),
                 _esc(r.get("sender")),
                 "ok" if r.get("status") == "success" else "warn",
-                _esc(r.get("status")), _when(r))
+                _esc(r.get("status")), _thumbs(r), _when(r))
             for r in forms)
     else:
         form_rows = '<tr><td colspan="5"><div class="empty">No contact forms submitted yet.</div></td></tr>'
@@ -626,6 +792,18 @@ CONTACTED_HTML = """<!doctype html>
 <meta charset="utf-8"><title>Already contacted - outreach agent</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{css}</style>
+<script>
+  /* The console stores the chosen theme; every page here follows it. Runs
+     before paint so there is no flash of the wrong palette. */
+  (function () {
+    try {
+      var t = localStorage.getItem('webifyTheme');
+      document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
+    } catch (e) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  })();
+</script>
 <div class="wrap">
   <div class="bar">
     <div>
@@ -644,11 +822,11 @@ CONTACTED_HTML = """<!doctype html>
 
   <div class="panel" id="p-mail">
     <table><thead><tr><th>Email address</th><th>Company / site</th><th>Sent from</th>
-      <th>Status</th><th>When</th></tr></thead><tbody>{mail_rows}</tbody></table>
+      <th>Status</th><th>Evidence</th><th>When</th></tr></thead><tbody>{mail_rows}</tbody></table>
   </div>
   <div class="panel" id="p-form" hidden>
     <table><thead><tr><th>Company / site</th><th>Form page</th><th>Filled as</th>
-      <th>Status</th><th>When</th></tr></thead><tbody>{form_rows}</tbody></table>
+      <th>Status</th><th>Evidence</th><th>When</th></tr></thead><tbody>{form_rows}</tbody></table>
   </div>
 </div>
 <script>

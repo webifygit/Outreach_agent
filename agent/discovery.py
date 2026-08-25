@@ -30,6 +30,39 @@ JUNK_EMAIL_RE = re.compile(
     re.I,
 )
 
+# The address pattern also matches things that merely look like one: a bundled
+# script ("vue@3.5.13.min.js"), or a JSON escape swept out of inline data
+# ("u003e@example.com"). Both were actually emailed before this existed.
+ASSET_TLD = {
+    "js", "mjs", "cjs", "css", "map", "json", "svg", "ico", "webp", "avif",
+    "woff", "woff2", "ttf", "otf", "eot", "mp4", "webm", "pdf", "zip", "min",
+    "html", "htm", "php", "aspx", "xml", "txt",
+    "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff",
+}
+JSON_ESCAPE_RE = re.compile(r"u00[0-9a-f]{2}|\[ux]", re.I)
+
+
+def plausible_email(addr: str) -> bool:
+    """Does this look like a mailbox someone reads, rather than a filename?"""
+    addr = (addr or "").strip().lower()
+    if addr.count("@") != 1:
+        return False
+    local, _, domain = addr.partition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    if JSON_ESCAPE_RE.search(local) or JSON_ESCAPE_RE.search(domain):
+        return False
+    labels = domain.split(".")
+    tld = labels[-1]
+    if tld in ASSET_TLD or not tld.isalpha() or not (2 <= len(tld) <= 24):
+        return False
+    # "3.5.13.min.js" - a version string, not a hostname
+    if any(label.isdigit() for label in labels):
+        return False
+    if not re.match(r"^[a-z0-9._%+-]+$", local):
+        return False
+    return True
+
 CAPTCHA_SELECTORS = [
     "iframe[src*='recaptcha']",
     "iframe[src*='hcaptcha']",
@@ -332,7 +365,7 @@ async def collect_emails(page, site_host: str) -> list[str]:
     seen, clean = set(), []
     for addr in found:
         addr = addr.strip().strip(".,;:'\"").lower()
-        if addr in seen or JUNK_EMAIL_RE.search(addr):
+        if addr in seen or JUNK_EMAIL_RE.search(addr) or not plausible_email(addr):
             continue
         seen.add(addr)
         clean.append(addr)
