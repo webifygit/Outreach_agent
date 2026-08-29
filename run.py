@@ -550,8 +550,27 @@ async def main_async(args) -> int:
     report_path = cfg.resolve(cfg.path("paths", "report_path", default="output/report.html"))
     report_mode = "live" if cfg.live else "dry_run"
 
+    # A hung browser call cannot be broken from inside: asyncio.wait_for cancels
+    # the task and then waits for a cancellation the driver never acknowledges,
+    # so the per-site ceiling hangs with it. This heartbeat is the way out - if
+    # no site has completed for long enough, end the process outright. The lock
+    # file is left behind on purpose, which is the signal the supervisor uses to
+    # restart and carry on from the next row.
+    heartbeat = {"at": time.time()}
+
+    async def watchdog():
+        limit = max(120.0, site_timeout * 2)
+        while True:
+            await asyncio.sleep(15)
+            idle = time.time() - heartbeat["at"]
+            if idle > limit:
+                log(f"no site has completed for {idle:.0f}s - the browser has stopped "
+                    f"responding; ending the process so the run can be restarted", logfile)
+                os._exit(3)
+
     async with async_playwright() as pw:
         browser, context = await open_browser(pw, cfg)
+        watch = asyncio.create_task(watchdog())
         recycle_every = int(cfg.path("run", "recycle_browser_every", default=50))
         max_consecutive = int(cfg.path("run", "max_consecutive_errors", default=6))
         consecutive_errors = 0
@@ -604,6 +623,7 @@ async def main_async(args) -> int:
                     res = _row_result(row, "error", f"{type(exc).__name__}: {str(exc)[:200]}")
                     break
 
+            heartbeat["at"] = time.time()
             results.append(res)
             state.record(row["website"], res)
             since_recycle += 1
@@ -631,6 +651,7 @@ async def main_async(args) -> int:
             if n < len(rows):
                 await asyncio.sleep(jitter(cfg.path("run", "delay_between_sites"), (8, 20)))
 
+        watch.cancel()
         try:
             await context.close()
         except Exception:
