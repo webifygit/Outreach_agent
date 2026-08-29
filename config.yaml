@@ -19,6 +19,8 @@ run:
                               # leak memory until Chromium falls over
   max_consecutive_errors: 6   # stop the run if this many sites fail back to back,
                               # rather than recording failures for untried rows
+  stall_timeout_s: 600        # if a run writes nothing for this long it is
+                              # wedged - kill it and carry on from where it stopped
   nav_retries: 2
   resume: true             # skip rows already marked done in output/state.json
   skip_already_contacted: true  # never contact a site, or an email address,

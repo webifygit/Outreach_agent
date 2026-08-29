@@ -164,6 +164,8 @@ EXTRACT_FORMS_JS = r"""
         agent_id: id,
         tag: tag,
         type: type,
+        name: el.getAttribute('name') || '',
+        checked: !!el.checked,
         required: el.hasAttribute('required') || el.getAttribute('aria-required') === 'true',
         visible: visible(el) && type !== 'hidden',
         maxlength: (typeof rawMax === 'number' && rawMax > 0 && rawMax < 100000) ? rawMax : null,

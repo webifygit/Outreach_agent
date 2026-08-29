@@ -255,7 +255,12 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .b-stop  { background: rgba(244,63,94,.12); border-color: rgba(244,63,94,.4); color: #FDA4AF; }
 .b-stop:hover:not(:disabled) { background: rgba(244,63,94,.2); }
 .b-go    { background: rgba(16,185,129,.13); border-color: rgba(16,185,129,.42); color: #6EE7B7; }
-  .b-resume { background: rgba(6,182,212,.13); border-color: rgba(6,182,212,.42); color: #67E8F9; }
+.b-go:hover:not(:disabled)     { background: rgba(16,185,129,.22); color: #A7F3D0; }
+.b-resume:hover:not(:disabled) { background: rgba(6,182,212,.22);  color: #A5F3FC; }
+.b-clear:hover:not(:disabled)  { background: rgba(245,158,11,.20); color: #FDE68A; }
+.b-bounce:hover:not(:disabled) { background: rgba(148,163,184,.20); color: #E2E8F0; }
+  .b-bounce { background: rgba(148,163,184,.10); border-color: rgba(148,163,184,.3); color: #CBD5E1; }
+.b-resume { background: rgba(6,182,212,.13); border-color: rgba(6,182,212,.42); color: #67E8F9; }
   .b-clear { background: rgba(245,158,11,.10); border-color: rgba(245,158,11,.38); color: #FCD34D; }
 .inline-row { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
 .inline-row .count {
@@ -308,6 +313,21 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 .leg .nm { flex: 1 1 auto; color: var(--ink-2); }
 .leg .ct { font-variant-numeric: tabular-nums; font-weight: 600; }
 .leg .pc { color: var(--ink-3); font-size: 11.5px; width: 44px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* --- reached headline --------------------------------------------------- */
+.reached-box {
+  border: 1px solid rgba(16,185,129,.28); border-radius: 12px; padding: 14px 16px;
+  margin-bottom: 16px; background: rgba(16,185,129,.07); text-align: center;
+}
+:root[data-theme="light"] .reached-box { background: #E9FBF3; border-color: #6EE7B7; }
+.reached-n { font-size: 34px; font-weight: 700; line-height: 1; color: var(--emerald);
+             font-variant-numeric: tabular-nums; }
+.reached-lab { font-size: 11.5px; letter-spacing: .07em; text-transform: uppercase;
+               color: var(--ink-3); margin-top: 5px; }
+.reached-split { display: flex; justify-content: center; gap: 16px; margin-top: 10px;
+                 font-size: 12.5px; color: var(--ink-2); flex-wrap: wrap; }
+.reached-split b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.reached-foot { font-size: 11.5px; color: var(--ink-3); margin-top: 8px; }
 
 /* --- status summary bars ------------------------------------------------ */
 .sbar { display: flex; align-items: center; gap: 9px; margin-bottom: 9px;
@@ -421,6 +441,63 @@ td .muted { color: var(--ink-3); }
 .toast.ok  { border-color: rgba(16,185,129,.4); }
 .toast.err { border-color: rgba(244,63,94,.45); }
 
+/* --- extra motion: each of these marks a state, not decoration ---------- */
+
+/* panels lift a little under the pointer, so what is interactive looks it */
+.card { transition: transform .25s ease, box-shadow .25s ease, border-color .25s ease; }
+.card:hover { transform: translateY(-2px); border-color: rgba(129,140,248,.32); }
+
+/* metric tiles respond to the pointer and glow briefly when their value moves */
+.tile { cursor: default; transition: transform .22s ease, border-color .22s ease, box-shadow .22s ease; }
+.tile:hover { transform: translateY(-2px); border-color: var(--edge); box-shadow: 0 8px 22px rgba(0,0,0,.28); }
+.tile.bump { animation: bump .5s ease, tileGlow .9s ease; }
+@keyframes tileGlow {
+  0%   { box-shadow: 0 0 0 0 rgba(99,102,241,.45); }
+  100% { box-shadow: 0 0 0 14px rgba(99,102,241,0); }
+}
+
+/* while a run is live the dashboard edge sweeps, so activity is visible
+   from across the room without reading a number */
+.is-running .card::after {
+  background: linear-gradient(90deg, transparent, rgba(6,182,212,.85), transparent);
+  animation: sweep 2.4s linear infinite;
+}
+@keyframes sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* the agent breathes gently even at rest - it is idle, not switched off */
+.orb { animation: idleFloat 6s ease-in-out infinite; }
+@keyframes idleFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+.is-running .orb { animation: breathe 3s ease-in-out infinite; }
+
+/* the reached headline counts up and pulses when it grows */
+.reached-n { transition: transform .3s ease; }
+.reached-box.grew { animation: reachedPop .7s ease; }
+@keyframes reachedPop {
+  0%   { box-shadow: 0 0 0 0 rgba(16,185,129,.5); }
+  40%  { transform: scale(1.015); }
+  100% { box-shadow: 0 0 0 16px rgba(16,185,129,0); transform: scale(1); }
+}
+
+/* nav items slide their icon and warm up on hover */
+.nav-item { transition: color .2s ease, background .2s ease, padding-left .2s ease; }
+.nav-item:hover { padding-left: 15px; }
+
+/* table rows lift very slightly, enough to track the one under the pointer */
+tbody tr { transition: background .2s ease, transform .2s ease; }
+tbody tr:hover { transform: translateX(2px); }
+
+/* chips in the top bar settle in one after another on load */
+.topbar .chip { animation: cardIn .4s cubic-bezier(.22,.9,.32,1) both; }
+.topbar .chip:nth-child(1) { animation-delay: .02s; }
+.topbar .chip:nth-child(2) { animation-delay: .06s; }
+.topbar .chip:nth-child(3) { animation-delay: .10s; }
+.topbar .chip:nth-child(4) { animation-delay: .14s; }
+.topbar .chip:nth-child(5) { animation-delay: .18s; }
+.topbar .chip:nth-child(6) { animation-delay: .22s; }
+
 /* --- reduced motion ----------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -436,6 +513,7 @@ td .muted { color: var(--ink-3); }
     background: linear-gradient(135deg, #059669, #0D9488); color: #fff;
     border-color: transparent; box-shadow: 0 6px 18px rgba(5,150,105,.28);
   }
+  :root[data-theme="light"] .b-bounce { background: #EEF1F8; color: #334155; border-color: rgba(15,23,42,.14); }
   :root[data-theme="light"] .b-resume {
     background: linear-gradient(135deg, #0891B2, #4F46E5); color: #fff;
     border-color: transparent; box-shadow: 0 6px 18px rgba(8,145,178,.28);
@@ -451,7 +529,16 @@ td .muted { color: var(--ink-3); }
   :root[data-theme="light"] button {
     background: #F1F3FA; color: #1F2A44; border-color: rgba(15,23,42,.14);
   }
-  :root[data-theme="light"] button:hover:not(:disabled) { background: #E6EAF6; }
+  /* the coloured buttons carry white text, so the generic grey hover must
+     not repaint them - it left the label invisible */
+  :root[data-theme="light"] button:hover:not(:disabled):not(.b-go):not(.b-resume):not(.b-start):not(.b-stop):not(.b-clear) {
+    background: #E6EAF6;
+  }
+  :root[data-theme="light"] .b-go:hover:not(:disabled),
+  :root[data-theme="light"] .b-resume:hover:not(:disabled),
+  :root[data-theme="light"] .b-start:hover:not(:disabled) {
+    filter: brightness(1.08); color: #fff;
+  }
   :root[data-theme="light"] .b-start {
     background: var(--brand); color: #fff; border-color: transparent;
   }
@@ -498,6 +585,10 @@ td .muted { color: var(--ink-3); }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>
         Contacted
       </a>
+      <a class="nav-item" href="/coverage">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
+        Coverage Check
+      </a>
       <a class="nav-item" href="/overall">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m7 14 3-4 3 3 5-7"/></svg>
         Overall Dashboard
@@ -526,6 +617,8 @@ td .muted { color: var(--ink-3); }
       <span class="chip"><span class="k">Started</span><b id="startedAt">-</b></span>
       <span class="chip"><span class="k">Rows</span><b id="rowCount">0</b></span>
       <span class="chip"><span class="k">Dry runs</span><b id="dryCount">0</b></span>
+      <span class="chip" title="Contacted by form or email, across every sheet">
+        <span class="dot on"></span><span class="k">Reached</span><b id="reachedChip">0</b></span>
       <span class="spacer"></span>
       <span class="chip"><span class="k">Theme</span>
         <label class="switch" style="width:38px;height:21px">
@@ -572,6 +665,9 @@ td .muted { color: var(--ink-3); }
           <span class="count" id="goliveCount">0</span>
           <button class="b-go" id="goliveBtn">Submit dry runs live</button>
         </div>
+        <div class="inline-row" id="bounceRow">
+          <button class="b-bounce" id="bounceBtn" style="width:100%">Check bounces</button>
+        </div>
         <div class="inline-row" id="clearRow" hidden>
           <span class="count" id="clearCount">0</span>
           <button class="b-clear" id="clearBtn">Clear dry runs</button>
@@ -580,7 +676,7 @@ td .muted { color: var(--ink-3); }
 
       <!-- ---------------- live dashboard ---------------- -->
       <section class="card" style="animation-delay:.14s">
-        <h3><span class="accent">▸</span> Live dashboard <span style="color:var(--ink-3);font-weight:500;text-transform:none;letter-spacing:0">(this sheet)</span></h3>
+        <h3><span class="accent">▸</span> Live dashboard <span id="dashScope" style="color:var(--ink-3);font-weight:500;text-transform:none;letter-spacing:0">(this sheet)</span></h3>
 
         <div class="tiles">
           <div class="tile t-total"><div class="k">Total</div><div class="v" id="mTotal">0</div></div>
@@ -606,6 +702,17 @@ td .muted { color: var(--ink-3); }
       <!-- ---------------- status summary ---------------- -->
       <section class="card col-3" style="animation-delay:.21s">
         <h3><span class="accent">▸</span> Status summary <span style="color:var(--ink-3);font-weight:500;text-transform:none;letter-spacing:0">(all sheets)</span></h3>
+
+        <div class="reached-box">
+          <div class="reached-n" id="reachedN">0</div>
+          <div class="reached-lab">businesses genuinely reached</div>
+          <div class="reached-split">
+            <span><b id="reachedForms">0</b> forms submitted</span>
+            <span><b id="reachedMails">0</b> emails delivered</span>
+          </div>
+          <div class="reached-foot" id="reachedFoot"></div>
+        </div>
+
         <div id="summary"><div class="empty">No history yet</div></div>
       </section>
 
@@ -662,6 +769,7 @@ const label = (s) => SHORT[s] || s;
 const BAD  = new Set(['failed','error','unreachable']);
 
 let uploadedPath = null, poller = null, seenRows = 0, firstPaint = true;
+let lastBounceAt = null, lastReached = null;
 let lastActivityKey = '', lastCounts = {};
 
 /* ---------- toasts -------------------------------------------------------- */
@@ -823,6 +931,25 @@ async function refresh() {
   stopBtn.disabled = !running;
   startBtn.disabled = running || !uploadedPath;
 
+  // bounce check runs on its own thread; mirror it on the button
+  const bounce = s.bounce || {};
+  const bBtn = $('bounceBtn');
+  if (bounce.running) {
+    bBtn.disabled = true;
+    bBtn.innerHTML = 'Checking <span class="dots"><i></i><i></i><i></i></span>';
+  } else if (bBtn.disabled) {
+    bBtn.disabled = false;
+    bBtn.textContent = 'Check bounces';
+    if (bounce.done_at && bounce.done_at !== lastBounceAt) {
+      lastBounceAt = bounce.done_at;
+      if (bounce.error) toast('Bounce check problem', bounce.error, 'err');
+      else if (bounce.bounced > 0)
+        toast('Undeliverable found', bounce.bounced + ' of ' + bounce.checked +
+              ' address(es) bounced - marked failed', 'ok');
+      else toast('No bounces', 'Everything sent was accepted (' + bounce.checked + ' checked)', 'ok');
+    }
+  }
+
   const canResume = !running && (s.remaining > 0) && !!s.can_go_live;
   $('resumeRow').hidden = !canResume;
   $('resumeCount').textContent = s.remaining ?? 0;
@@ -836,10 +963,23 @@ async function refresh() {
 
   let data;
   try { data = await (await fetch('/api/rows')).json(); } catch (e) { return; }
-  const rows = data.rows || [], meta = data.meta || {}, overall = data.overall || {};
+  let rows = data.rows || [];
+  const meta = data.meta || {}, overall = data.overall || {};
 
-  const total = meta.total || rows.length;
-  const done  = rows.filter(r => r.status && r.status !== 'running').length;
+  const preview = meta.mode === 'preview';
+  // A run writes its first rows a minute or so after starting, so between
+  // pressing Start and the first result the feed still holds the PREVIOUS
+  // run's data. Showing that would report the old sheet's totals as if they
+  // were this one's, so treat anything older than the run as not-yet-arrived.
+  const stale = running && meta.generated && s.started_at &&
+                meta.generated < s.started_at;
+  // the new sheet's size is not known until the run reports it, so show
+  // nothing rather than the previous sheet's figure
+  const total = stale ? 0 : (meta.total || rows.length);
+  const done  = (preview || stale) ? 0
+              : rows.filter(r => r.status && r.status !== 'running').length;
+  if (stale) rows = [];
+  // the labels stay honest either way: nothing is completed until a run does it
   const fail  = rows.filter(r => BAD.has(r.status)).length;
   setNumber($('mTotal'), total);
   setNumber($('mDone'),  done);
@@ -848,6 +988,9 @@ async function refresh() {
   $('rowCount').textContent = total;
 
   const pct = total ? Math.round(done / total * 100) : 0;
+  $('dashScope').textContent = preview ? '(uploaded sheet - not run yet)'
+                              : stale ? '(starting - first results on the way)'
+                              : '(this sheet)';
   $('pbar').style.width = pct + '%';
   $('pctText').textContent = pct + '%';
 
@@ -858,6 +1001,26 @@ async function refresh() {
     renderLegend(counts, rows.length);
     lastCounts = counts;
   }
+  // "reached" is not a status of its own - it is sent + success + uncertain,
+  // which is easy to miss when they sit as three separate rows.
+  const forms = overall.forms || 0, mails = overall.emails || 0;
+  const reachedNow = forms + mails;
+  if (lastReached !== null && reachedNow > lastReached) {
+    const box = document.querySelector('.reached-box');
+    box.classList.remove('grew'); void box.offsetWidth; box.classList.add('grew');
+  }
+  lastReached = reachedNow;
+  setNumber($('reachedN'), reachedNow);
+  $('reachedForms').textContent = forms;
+  $('reachedMails').textContent = mails;
+  $('reachedChip').textContent = forms + mails;
+  const bs = overall.by_status || {};
+  const unconfirmed = bs.uncertain || 0, failed = (bs.failed || 0);
+  $('reachedFoot').textContent =
+    `of ${overall.sites || 0} sites seen` +
+    (unconfirmed ? ` · ${unconfirmed} submitted without confirmation` : '') +
+    (failed ? ` · ${failed} failed or bounced` : '');
+
   renderSummary(overall.by_status || {});
   renderRows(rows);
   renderFeed(rows);
@@ -899,7 +1062,10 @@ async function upload(file) {
     $('fileChip').className = 'file-chip show';
     $('fileChip').textContent = '✓  ' + data.name;
     startBtn.disabled = false;
-    toast('Spreadsheet uploaded', data.name, 'ok');
+    toast('Spreadsheet uploaded',
+          data.rows + ' rows' + (data.already ? ' - ' + data.already + ' already contacted' : ''), 'ok');
+    seenRows = 0;
+    refresh();
   } catch (e) { toast('Upload failed', String(e), 'err'); }
 }
 
@@ -938,6 +1104,24 @@ stopBtn.addEventListener('click', async () => {
   stopBtn.textContent = '■ Stop';
   toast('Run stopped', 'The agent was asked to stop');
   refresh();
+});
+
+$('bounceBtn').addEventListener('click', async () => {
+  const btn = $('bounceBtn');
+  if (!confirm('Check both sending mailboxes for bounced email?\n\n' +
+               'Read-only on the mailboxes. Any address that bounced is marked failed, ' +
+               'which frees that business to be approached another way. ' +
+               'A backup of the history is saved first.')) return;
+  btn.disabled = true;
+  btn.innerHTML = 'Checking <span class="dots"><i></i><i></i><i></i></span>';
+  const data = await post('/check-bounces');
+  if (data.error) {
+    toast('Could not check', data.error, 'err');
+    btn.disabled = false; btn.textContent = 'Check bounces';
+    return;
+  }
+  toast('Checking mailboxes', 'This takes a minute or two', 'ok');
+  startPolling();
 });
 
 $('resumeBtn').addEventListener('click', async () => {

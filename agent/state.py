@@ -80,7 +80,10 @@ class State:
         # dry_run is a rehearsal, not a completed attempt - it must never
         # block a real (live) attempt at the same row from actually running.
         entry = self.data.get(url)
-        return bool(entry) and entry.get("status") not in {None, "", "error", "dry_run"}
+        # skipped_no_email is not a verdict about the site - email was simply
+        # switched off at the time. Turning it back on must pick these up again.
+        return bool(entry) and entry.get("status") not in {
+            None, "", "error", "dry_run", "skipped_no_email"}
 
     def get(self, url: str) -> dict | None:
         return self.data.get(url)

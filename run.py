@@ -279,10 +279,16 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     # ---- email fallback -------------------------------------------------
     host = urlparse(url).netloc
     sheet_email = str(row.get("email") or "").strip()
-    # Look past the current page: the address is usually on /contact-us/, and
-    # a site with no reachable address at all is the one outcome that leaves
-    # the agent with nothing to do.
-    scraped = await discovery.harvest_emails(page, host, contact_candidates, timeout)
+    email_on = bool(cfg.path("email", "enabled", default=True))
+    if not email_on:
+        # Forms only. Skip the address hunt entirely - it costs page loads and
+        # would only produce an address we are not allowed to write to.
+        scraped = []
+    else:
+        # Look past the current page: the address is usually on /contact-us/, and
+        # a site with no reachable address at all is the one outcome that leaves
+        # the agent with nothing to do.
+        scraped = await discovery.harvest_emails(page, host, contact_candidates, timeout)
     address = sheet_email or (scraped[0] if scraped else "")
 
     if not address and spare_form_url:
@@ -308,8 +314,15 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
 
     if not address:
         result["method"] = result["method"] or "none"
-        result["status"] = "no_contact_found"
-        result["detail"] += "no contact form and no email address discoverable"
+        if not email_on:
+            # Say why plainly: this site may well have an address, we are simply
+            # not using email at the moment. Re-runs will pick it up again.
+            result["status"] = "skipped_no_email"
+            result["detail"] += ("no usable contact form, and email is paused "
+                                 "(email.enabled: false) - not contacted")
+        else:
+            result["status"] = "no_contact_found"
+            result["detail"] += "no contact form and no email address discoverable"
         return result
 
     # One message per mailbox, however many sites point at it. Two domains
@@ -598,7 +611,14 @@ async def main_async(args) -> int:
             # This sheet's own numbers - not the running total across every
             # sheet ever uploaded, which is what the overall dashboard is for.
             build_report(dup_skips + results, report_mode, report_path)
-            _dump_rows(cfg, dup_skips + results, report_mode, len(rows), n)
+            # Rebuilt here rather than only at the end: every run since the 27th
+            # was stopped or wedged before the final build, leaving the overall
+            # dashboard two days stale.
+            build_report(list(state.data.values()), report_mode,
+                         cfg.resolve(cfg.path("paths", "report_all_path",
+                                              default="output/report_all.html")))
+            _dump_rows(cfg, dup_skips + results, report_mode,
+                       len(dup_skips) + len(rows), len(dup_skips) + n)
 
             # Burning through the rest of the sheet recording failures is worse
             # than stopping: the rows look attempted when they never were.
@@ -625,7 +645,8 @@ async def main_async(args) -> int:
     log(f"done - {len(results)} rows -> {out}", logfile)
     log(f"screenshots -> {ev.dir}", logfile)
 
-    _dump_rows(cfg, dup_skips + results, report_mode, len(rows), len(rows))
+    _dump_rows(cfg, dup_skips + results, report_mode,
+               len(dup_skips) + len(rows), len(dup_skips) + len(results))
     report = build_report(dup_skips + results, report_mode, report_path)
     log(f"dashboard (this sheet) -> {report}", logfile)
     overall = build_report(list(state.data.values()), report_mode,

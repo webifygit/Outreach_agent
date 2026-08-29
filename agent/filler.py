@@ -67,6 +67,10 @@ CONSENT_RE = re.compile(
 )
 MARKETING_OPTIN_RE = re.compile(r"newsletter|subscribe|marketing|updates|promotion", re.I)
 
+# Options that ask for more than a click - "other" usually reveals a text box
+# that is then required, and an opt-in is not ours to accept.
+SKIP_OPTION_RE = re.compile(r"other|please specify|newsletter|subscribe|marketing", re.I)
+
 
 def classify(fields: list[dict]) -> dict[str, dict]:
     """Assign one field per role. Only visible, fillable fields are considered.
@@ -213,6 +217,31 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
                     await frame.check(f"[data-agent-id='{field['agent_id']}']", timeout=4000)
                 except Exception:
                     pass
+
+    # Required radio groups - "Please select a vehicle brand", "preferred
+    # dealer". Left blank the form is rejected and the site falls back to
+    # email, which is how a contactable business ends up emailed instead.
+    # There is no good answer to give, so take the first real option.
+    groups: dict[str, list[dict]] = {}
+    for field in form["fields"]:
+        if field["type"] != "radio" or not field["visible"]:
+            continue
+        groups.setdefault(field.get("name") or field["agent_id"], []).append(field)
+
+    for name, options in groups.items():
+        if any(o.get("checked") for o in options):
+            continue                       # the site already picked one
+        if not any(o["required"] for o in options):
+            continue                       # optional - leave it alone
+        for option in options:
+            if SKIP_OPTION_RE.search(option["desc"]):
+                continue                   # not "other", which usually opens a text box
+            try:
+                await frame.check(f"[data-agent-id='{option['agent_id']}']", timeout=4000)
+                filled[f"radio:{name[:24]}"] = option["desc"][:40]
+                break
+            except Exception:
+                continue
 
     for field in form["fields"]:
         if field["required"] and field["visible"] and field["type"] not in {"checkbox", "radio"}:

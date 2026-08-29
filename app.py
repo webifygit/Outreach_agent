@@ -22,7 +22,9 @@ import json
 import secrets
 import subprocess
 import sys
+import re
 import threading
+import time
 from html import escape as html_escape
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +55,8 @@ REPORT_PATH = cfg.resolve(cfg.path("paths", "report_path", default="output/repor
 STATE_FILE = cfg.resolve(cfg.path("paths", "state_path", default="output/state.json"))
 EVIDENCE_DIR = cfg.resolve(cfg.path("paths", "evidence_dir", default="evidence"))
 LAUNCH_LOG = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log")).with_name("webapp_launch.log")
+RUN_LOG = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log"))
+MODE_FILE = STATE_FILE.with_name("last_run_mode.json")
 
 app = Flask(__name__)
 
@@ -123,6 +127,7 @@ def _require_auth():
 
 _lock = threading.Lock()
 STATE: dict = {"proc": None, "input": None, "input_path": None, "live": False,
+               "preview": None, "preview_path": None,
                "started_at": None, "stopped_by_user": False, "restarts": 0}
 
 
@@ -159,7 +164,9 @@ def _last_input() -> Path | None:
     if path and Path(path).exists():
         return Path(path)
     try:
-        uploads = sorted(UPLOAD_DIR.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        # top level only - uploads/coverage/ holds sheets that were merely checked
+        uploads = sorted((p for p in UPLOAD_DIR.glob("*.*") if p.is_file()),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return None
     for candidate in uploads:
@@ -271,6 +278,7 @@ def _status() -> dict:
         "problem": _last_problem() if (code not in (0, None)) else "",
         "dry_runs": _dry_run_count(),
         "remaining": _remaining_count(),
+        "bounce": dict(BOUNCE),
         "restarts": STATE.get("restarts", 0),
         "can_go_live": _last_input() is not None and not running,
         "running": running,
@@ -296,7 +304,53 @@ def upload():
     stamped = f"{datetime.now():%Y%m%d_%H%M%S}_{name}"
     dest = UPLOAD_DIR / stamped
     f.save(dest)
-    return jsonify(path=str(dest), name=stamped)
+
+    preview, already = _preview_rows(dest)
+    STATE["preview"] = preview
+    STATE["preview_path"] = str(dest)
+    return jsonify(path=str(dest), name=stamped,
+                   rows=len(preview), already=already)
+
+
+def _preview_rows(path) -> tuple[list[dict], int]:
+    """The uploaded sheet as dashboard rows, before anything has been run.
+
+    A row already in the history is shown with the outcome it will get -
+    skipped - so the count of what is actually pending is honest.
+    """
+    try:
+        from agent.sheet import load_rows
+        from agent.state import norm_site
+        rows, _ = load_rows(path)
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+    except Exception:
+        return [], 0
+
+    scope = str(cfg.path("run", "dedupe_scope", default="host"))
+    contacted = {}
+    for url, rec in data.items():
+        if rec.get("status") in ("sent", "success", "uncertain"):
+            contacted[norm_site(url, scope)] = rec
+
+    out = []
+    for r in rows:
+        prior = contacted.get(norm_site(r["website"], scope))
+        out.append({
+            "website": r["website"], "company": r["company_name"],
+            "method": "",
+            "status": "pending",
+            "detail": (f"already contacted by {prior.get('method')} on "
+                       f"{str(prior.get('timestamp'))[:10]} - will be skipped"
+                       if prior else "not processed yet"),
+            "email_used": (prior or {}).get("email_used", ""),
+            "contact_page": (prior or {}).get("contact_page", ""),
+            "sender": (prior or {}).get("sender", ""),
+            "timestamp": str((prior or {}).get("timestamp", "")),
+            "shot_before": "", "shot_after": "",
+        })
+    already = sum(1 for r in rows
+                  if contacted.get(norm_site(r["website"], scope)) is not None)
+    return out, already
 
 
 @app.post("/start")
@@ -332,22 +386,116 @@ def _spawn(argv, log_fh):
     return subprocess.Popen(argv, cwd=str(ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
 
 
-def _supervise(argv, log_fh):
-    """Relaunch the run if it dies unexpectedly, until it finishes or is stopped.
+def _last_progress_at() -> float:
+    """When the run last wrote anything. 0 if it never has."""
+    newest = 0.0
+    rows_path = cfg.resolve(cfg.path("paths", "rows_json_path", default="output/run_rows.json"))
+    for path in (STATE_FILE, rows_path, LAUNCH_LOG):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
 
-    The lock file is the signal: run.py removes it on a clean finish, so a lock
-    still present after the process has gone means it died mid-run.
+
+CURRENT_SITE_RE = re.compile(r"\[\d+/\d+\]\s+(\S+)\s*$")
+
+
+def _site_in_flight() -> str:
+    """The site the run announced most recently - the one it is stuck on."""
+    try:
+        tail = RUN_LOG.read_text(encoding="utf-8", errors="replace")[-4000:]
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        m = CURRENT_SITE_RE.search(line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _record_stalled_site(url: str) -> None:
+    """Mark a site that wedged the browser so a resume steps past it.
+
+    Without this the restart lands on the same site, wedges again, and the
+    supervisor loops until it hits the restart ceiling - the run never moves.
+    """
+    if not url:
+        return
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+        if state.get(url, {}).get("status") in ("sent", "success", "uncertain"):
+            return                      # already reached; leave that record alone
+        prior = state.get(url, {})
+        state[url] = {
+            "row_index": prior.get("row_index", 0),
+            "website": url,
+            "company_name": prior.get("company_name", ""),
+            "method": "none", "status": "timeout",
+            "detail": "the browser wedged here and the run had to be restarted - skipped",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except Exception:
+        pass
+
+
+def _wait_or_stall(proc, log_fh, stall_after: float) -> bool:
+    """Wait for the run to end. True if it was killed for going quiet.
+
+    A site can legitimately take minutes - a slow page, retries, the pause
+    between sites - so this is deliberately patient. It is here for the case
+    where nothing is happening at all.
+    """
+    while proc.poll() is None:
+        time.sleep(10)
+        if STATE.get("stopped_by_user"):
+            return False
+        last = _last_progress_at()
+        if last and (time.time() - last) > stall_after:
+            mins = stall_after / 60
+            stuck_on = _site_in_flight()
+            log_fh.write(f"--- no progress for {mins:.0f} minutes; wedged on "
+                         f"{stuck_on or 'an unknown site'}, killing it so it can resume ---\n")
+            log_fh.flush()
+            _record_stalled_site(stuck_on)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            proc.wait()
+            return True
+    return False
+
+
+def _supervise(argv, log_fh):
+    """Keep the run going until it finishes or is stopped.
+
+    Two failure modes to cover: the process dying outright (the lock file is
+    left behind), and the process wedging with nothing to report (caught by
+    the stall watch above). Either way it is restarted and continues.
     """
     restarts = 0
+    stall_after = float(cfg.path("run", "stall_timeout_s", default=600))
+    # a restart should carry on, not redo the rows already attempted
+    if "--continue-batch" not in argv:
+        argv = argv + ["--continue-batch"]
     try:
         while True:
             proc = STATE["proc"]
-            proc.wait()
+            stalled = _wait_or_stall(proc, log_fh, stall_after)
+            if stalled:
+                try:
+                    LOCK_FILE.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
             if STATE.get("stopped_by_user"):
                 log_fh.write("--- stopped by user; not restarting ---\n")
                 break
-            if not LOCK_FILE.exists():
+            if not stalled and not LOCK_FILE.exists():
                 log_fh.write("--- run finished cleanly ---\n")
                 break
             if restarts >= MAX_RESTARTS:
@@ -359,8 +507,8 @@ def _supervise(argv, log_fh):
                 LOCK_FILE.unlink(missing_ok=True)   # the dead run's lock
             except OSError:
                 pass
-            log_fh.write(f"--- run died unexpectedly; restart {restarts}/{MAX_RESTARTS}, "
-                         f"resuming from state.json ---\n")
+            log_fh.write(f"--- {'wedged' if stalled else 'died unexpectedly'}; "
+                         f"restart {restarts}/{MAX_RESTARTS}, resuming from state.json ---\n")
             log_fh.flush()
             with _lock:
                 STATE["proc"] = _spawn(argv, log_fh)
@@ -393,6 +541,14 @@ def start_run(input_path: Path, live: bool, headless: bool, limit: int,
         pass
 
     proc = _spawn(argv, log_fh)
+    # Persist the mode: STATE lives in memory, so after a service restart a
+    # Resume was defaulting to a dry run and silently sending nothing.
+    try:
+        MODE_FILE.write_text(json.dumps({"live": bool(live), "input": str(input_path)}),
+                             encoding="utf-8")
+    except OSError:
+        pass
+    STATE["preview"] = None          # live results take over from here
     STATE.update(proc=proc, input=input_path.name, input_path=str(input_path),
                  live=live, started_at=datetime.now().isoformat(timespec="seconds"),
                  stopped_by_user=False, restarts=0)
@@ -470,6 +626,70 @@ def clear_drafts():
     return jsonify(removed=len(drafts), kept=len(kept), contacted=contacted, backup=backup.name)
 
 
+BOUNCE: dict = {"running": False, "done_at": None, "checked": 0,
+                "bounced": 0, "error": "", "addresses": []}
+
+
+def _bounce_worker() -> None:
+    """Find undeliverable addresses and mark those rows failed.
+
+    Same rules as the command line: read-only on the mailboxes, only addresses
+    this agent sent to, hard failures only. A backup of the history is written
+    before anything changes.
+    """
+    from agent.bounces import check_all
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        by_address: dict[str, list[str]] = {}
+        for url, row in state.items():
+            if row.get("status") == "sent" and row.get("email_used"):
+                by_address.setdefault(str(row["email_used"]).lower(), []).append(url)
+
+        BOUNCE["checked"] = len(by_address)
+        if not by_address:
+            BOUNCE.update(running=False, bounced=0, addresses=[],
+                          done_at=datetime.now().isoformat(timespec="seconds"))
+            return
+
+        bounced, problems = check_all(cfg, set(by_address))
+        if bounced:
+            backup = STATE_FILE.with_name(
+                f"state-backup-bounces-{datetime.now():%Y%m%d_%H%M%S}.json")
+            backup.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+            for addr, why in bounced.items():
+                for url in by_address[addr]:
+                    row = state[url]
+                    row["status"] = "failed"
+                    row["detail"] = (f"email to {addr} bounced - undeliverable "
+                                     f"({why[:60]}). " + str(row.get("detail", "")))[:600]
+                    row["bounced_at"] = datetime.now().isoformat(timespec="seconds")
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+            tmp.replace(STATE_FILE)
+
+        BOUNCE.update(running=False, bounced=len(bounced),
+                      addresses=sorted(bounced)[:40],
+                      error="; ".join(problems)[:200],
+                      done_at=datetime.now().isoformat(timespec="seconds"))
+    except Exception as exc:  # noqa: BLE001
+        BOUNCE.update(running=False, error=f"{type(exc).__name__}: {exc}"[:200],
+                      done_at=datetime.now().isoformat(timespec="seconds"))
+
+
+@app.post("/check-bounces")
+def check_bounces():
+    """Start the bounce check. Returns immediately; poll /status for the result."""
+    with _lock:
+        proc = STATE["proc"]
+        if (proc is not None and proc.poll() is None) or _external_run_active():
+            return jsonify(error="a run is in progress - it is writing the history"), 409
+        if BOUNCE["running"]:
+            return jsonify(error="a bounce check is already running"), 409
+        BOUNCE.update(running=True, bounced=0, checked=0, error="", addresses=[], done_at=None)
+    threading.Thread(target=_bounce_worker, daemon=True).start()
+    return jsonify(started=True)
+
+
 @app.post("/resume")
 def resume():
     """Carry on with the last sheet, skipping every row already attempted.
@@ -484,7 +704,14 @@ def resume():
         path = _last_input()
         if path is None:
             return jsonify(error="nothing to resume - upload a sheet and run it first"), 400
-        live = bool(STATE.get("live"))
+        live = STATE.get("live")
+        if live is None or not STATE.get("input_path"):
+            # not this process's run - recover the mode from disk
+            try:
+                live = bool(json.loads(MODE_FILE.read_text(encoding="utf-8")).get("live"))
+            except Exception:
+                live = False
+        live = bool(live)
 
     return start_run(path, live=live, headless=True, limit=0, continue_batch=True)
 
@@ -585,8 +812,13 @@ def _contacted_rows():
         return [], []
     reached = [r for r in data.values() if r.get("status") in ("sent", "success", "uncertain")]
     reached.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
+    missed = [r for r in data.values()
+              if r.get("status") in ("no_contact_found", "unreachable",
+                                     "failed", "error", "timeout")]
+    missed.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
     return ([r for r in reached if r.get("method") == "email"],
-            [r for r in reached if r.get("method") == "form"])
+            [r for r in reached if r.get("method") == "form"],
+            missed)
 
 
 def _esc(value) -> str:
@@ -655,13 +887,20 @@ def api_rows():
     agent already produces.
     """
     rows, meta = [], {}
-    rows_path = cfg.resolve(cfg.path("paths", "rows_json_path", default="output/run_rows.json"))
-    try:
-        payload = json.loads(rows_path.read_text(encoding="utf-8"))
-        rows = payload.get("rows", [])
-        meta = {k: payload.get(k) for k in ("mode", "total", "done", "generated")}
-    except Exception:
-        pass
+    preview = STATE.get("preview")
+    if preview:
+        # a sheet has been uploaded but not run: show it rather than the last run
+        rows = preview
+        # nothing has run yet, so every counter starts at zero
+        meta = {"mode": "preview", "total": len(preview), "done": 0, "generated": ""}
+    else:
+        rows_path = cfg.resolve(cfg.path("paths", "rows_json_path", default="output/run_rows.json"))
+        try:
+            payload = json.loads(rows_path.read_text(encoding="utf-8"))
+            rows = payload.get("rows", [])
+            meta = {k: payload.get(k) for k in ("mode", "total", "done", "generated")}
+        except Exception:
+            pass
 
     overall = {"sites": 0, "emails": 0, "forms": 0, "by_status": {}}
     try:
@@ -700,6 +939,261 @@ def api_rows():
             "shot_after": shot(r.get("screenshot_after", "")),
         })
     return jsonify(rows=slim, meta=meta, overall=overall)
+
+
+REACHED_STATUSES = ("sent", "success", "uncertain")
+TRIED_STATUSES = ("failed", "no_contact_found", "timeout", "error", "dry_run")
+
+
+def _coverage(path):
+    """Classify every row of a sheet against the contact history."""
+    from agent.sheet import load_rows
+    from agent.state import norm_site
+
+    scope = str(cfg.path("run", "dedupe_scope", default="host"))
+    rows, skipped = load_rows(path)
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+
+    by_host: dict[str, dict] = {}
+    for url, rec in state.items():
+        key = norm_site(url, scope)
+        prior = by_host.get(key)
+        # a real contact always wins over an earlier attempt at the same site
+        if prior is None or (rec.get("status") in REACHED_STATUSES
+                             and prior.get("status") not in REACHED_STATUSES):
+            by_host[key] = rec
+
+    out = []
+    for r in rows:
+        rec = by_host.get(norm_site(r["website"], scope))
+        status = (rec or {}).get("status")
+        method = (rec or {}).get("method", "")
+        if status in REACHED_STATUSES or status == "skipped_duplicate":
+            # skipped_duplicate means it had already been reached elsewhere
+            bucket = "form" if method == "form" else "email"
+        elif status in ("failed", "error", "timeout"):
+            bucket = "failed"
+        elif status in ("no_contact_found", "unreachable"):
+            bucket = "noroute"
+        elif rec:
+            bucket = "never"           # rehearsed only - never actually sent
+        else:
+            bucket = "never"
+        out.append({
+            "website": r["website"], "company": r["company_name"],
+            "bucket": bucket, "reached": bucket in ("form", "email"),
+            "method": method, "status": status or "never attempted",
+            "why": _why_not(rec) if rec and bucket in ("failed", "noroute") else "",
+            "via": (rec or {}).get("email_used") or (rec or {}).get("contact_page") or "",
+            "sender": (rec or {}).get("sender_email") or (rec or {}).get("sender") or "",
+            "when": str((rec or {}).get("timestamp", ""))[:16].replace("T", " "),
+        })
+    return out, skipped
+
+
+@app.post("/coverage")
+def coverage_check():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify(error="no file received"), 400
+    name = secure_filename(f.filename)
+    if Path(name).suffix.lower() not in ALLOWED_EXT:
+        return jsonify(error=f"unsupported file type - use {', '.join(sorted(ALLOWED_EXT))}"), 400
+    # Deliberately NOT in UPLOAD_DIR: Resume and "submit live" target the newest
+    # upload, and a sheet dropped here is being checked, not queued for sending.
+    check_dir = UPLOAD_DIR / "coverage"
+    check_dir.mkdir(parents=True, exist_ok=True)
+    dest = check_dir / f"{datetime.now():%Y%m%d_%H%M%S}_{name}"
+    f.save(dest)
+
+    try:
+        rows, skipped = _coverage(dest)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify(error=f"could not read that sheet: {exc}"), 400
+
+    # the unreached ones, ready to upload and run
+    unreached = [r for r in rows if not r["reached"]]
+    out_path = cfg.resolve("output") / f"unreached_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    try:
+        import pandas as pd
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"Website": r["website"], "Company Name": r["company"],
+                       "Why not reached": r["why"] or r["status"]}
+                      for r in unreached]).to_excel(out_path, index=False)
+        STATE["coverage_download"] = str(out_path)
+    except Exception:
+        STATE["coverage_download"] = ""
+
+    counts = {b: sum(r["bucket"] == b for r in rows)
+              for b in ("form", "email", "failed", "noroute", "never")}
+    counts["reached"] = counts["form"] + counts["email"]
+    return jsonify(rows=rows, counts=counts, total=len(rows),
+                   skipped=len(skipped), sheet=name,
+                   download=bool(STATE.get("coverage_download")))
+
+
+@app.get("/coverage/download")
+def coverage_download():
+    path = STATE.get("coverage_download")
+    if not path or not Path(path).exists():
+        return "nothing to download - run a check first", 404
+    p = Path(path)
+    return send_from_directory(p.parent, p.name, as_attachment=True)
+
+
+@app.get("/coverage")
+def coverage_page():
+    return COVERAGE_HTML.replace("{css}", CONTACTED_CSS)
+
+
+COVERAGE_HTML = """<!doctype html>
+<meta charset="utf-8"><title>Coverage check - outreach agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{css}
+  .drop { border:1.5px dashed var(--edge); border-radius:14px; padding:34px 18px;
+          text-align:center; cursor:pointer; transition:border-color .2s, background .2s; }
+  .drop:hover, .drop.drag { border-color:var(--accent); background:rgba(99,102,241,.06); }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           gap:12px; margin:22px 0 18px; }
+  .tile { border:1px solid var(--edge); border-radius:12px; padding:14px 16px; background:var(--surface);
+          text-align:left; cursor:pointer; font:inherit; color:inherit;
+          transition:transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
+  .tile:hover { transform:translateY(-2px); border-color:var(--accent); }
+  .tile[aria-pressed="true"] { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .v-ok { color:#10B981; } .v-tot { color:#06B6D4; }
+  .v-bad { color:#F43F5E; } .v-warn { color:#F59E0B; }
+  .tile .k { font-size:10.5px; letter-spacing:.09em; text-transform:uppercase; color:var(--ink-3); }
+  .tile .v { font-size:27px; font-weight:700; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .v-reached { color:#10B981; } .v-tried { color:#F59E0B; } .v-never { color:#F43F5E; }
+  .filters { display:flex; gap:7px; margin-bottom:12px; flex-wrap:wrap; }
+  .filters button { padding:7px 13px; border-radius:999px; font-size:12.5px; cursor:pointer;
+                    border:1px solid var(--edge); background:var(--surface); color:var(--ink-2); }
+  .filters button[aria-pressed="true"] { background:var(--accent); color:#fff; border-color:transparent; }
+  .hidden { display:none; }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('webifyTheme');
+      document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
+    } catch (e) { document.documentElement.setAttribute('data-theme', 'dark'); }
+  })();
+</script>
+<div class="wrap">
+  <div class="bar">
+    <div>
+      <h1>Coverage check</h1>
+      <p class="sub">Upload a sheet to see which of its sites were actually reached - by form or by email - and which were not.</p>
+    </div>
+    <div>
+      <a class="btn" href="/contacted">Already contacted</a>
+      <a class="btn" href="/">&larr; Back to runs</a>
+    </div>
+  </div>
+
+  <div class="drop" id="drop" tabindex="0" role="button">
+    <strong>Drop a spreadsheet here</strong> or click to choose
+    <div class="sub" style="margin:6px 0 0">.xlsx, .xls or .csv &middot; nothing is contacted, this only reads</div>
+  </div>
+  <input type="file" id="file" accept=".xlsx,.xls,.csv,.tsv" hidden>
+
+  <div id="out" class="hidden">
+    <div class="tiles">
+      <button class="tile pick" data-f="form"><div class="k">Reached by form</div><div class="v v-ok" id="c-form">0</div></button>
+      <button class="tile pick" data-f="email"><div class="k">Reached by email</div><div class="v v-ok" id="c-email">0</div></button>
+      <button class="tile pick" data-f="reached"><div class="k">Reached total</div><div class="v v-tot" id="c-reached">0</div></button>
+      <button class="tile pick" data-f="failed"><div class="k">Failed or bounced</div><div class="v v-bad" id="c-failed">0</div></button>
+      <button class="tile pick" data-f="noroute"><div class="k">No contact route</div><div class="v v-warn" id="c-noroute">0</div></button>
+      <button class="tile pick" data-f="never"><div class="k">Never attempted</div><div class="v v-warn" id="c-never">0</div></button>
+      <button class="tile pick" data-f="all" aria-pressed="true"><div class="k">All rows</div><div class="v" id="c-total">0</div></button>
+    </div>
+
+    <div class="filters">
+      <span id="showing" class="sub" style="margin:0"></span>
+      <span style="flex:1 1 auto"></span>
+      <a class="btn" id="dl" href="/coverage/download">Download the ones not reached</a>
+    </div>
+
+    <div class="panel" style="border-top:1px solid var(--edge); border-radius:12px;">
+      <table><thead><tr><th>Website</th><th>Company</th><th>Outcome</th>
+        <th>How</th><th>Address / form page used</th><th>When</th></tr></thead>
+        <tbody id="rows"></tbody></table>
+    </div>
+  </div>
+</div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const drop = $('drop'), file = $('file');
+  let all = [];
+
+  drop.addEventListener('click', () => file.click());
+  drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') file.click(); });
+  ['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
+  ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); }));
+  drop.addEventListener('drop', e => { if (e.dataTransfer.files[0]) send(e.dataTransfer.files[0]); });
+  file.addEventListener('change', () => { if (file.files[0]) send(file.files[0]); });
+
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"]/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  }
+
+  async function send(f) {
+    drop.innerHTML = '<strong>Checking ' + esc(f.name) + '...</strong>';
+    const fd = new FormData(); fd.append('file', f);
+    const res = await fetch('/coverage', { method: 'POST', body: fd });
+    const d = await res.json();
+    if (d.error) { drop.innerHTML = '<strong>' + esc(d.error) + '</strong>'; return; }
+    drop.innerHTML = '<strong>' + esc(d.sheet) + '</strong> - ' + d.total +
+                     ' rows checked. Drop another to check again.';
+    all = d.rows;
+    $('c-total').textContent = d.total;
+    $('c-form').textContent = d.counts.form;
+    $('c-email').textContent = d.counts.email;
+    $('c-reached').textContent = d.counts.reached;
+    $('c-failed').textContent = d.counts.failed;
+    $('c-noroute').textContent = d.counts.noroute;
+    $('c-never').textContent = d.counts.never;
+    document.querySelectorAll('.tile.pick').forEach(x =>
+      x.setAttribute('aria-pressed', x.dataset.f === 'all'));
+    $('dl').style.display = d.download ? '' : 'none';
+    $('out').classList.remove('hidden');
+    render('all');
+  }
+
+  const LABEL = { form: 'reached by form', email: 'reached by email',
+                  reached: 'reached', failed: 'failed or bounced',
+                  noroute: 'no contact route', never: 'never attempted', all: 'all rows' };
+
+  function render(filter) {
+    const rows = filter === 'all' ? all
+               : filter === 'reached' ? all.filter(r => r.reached)
+               : all.filter(r => r.bucket === filter);
+    $('showing').textContent = rows.length + ' of ' + all.length + ' - ' + LABEL[filter];
+    $('rows').innerHTML = rows.length ? rows.map(r => {
+      const pill = r.reached ? 'ok' : 'warn';
+      return '<tr><td><a href="' + esc(r.website) + '" target="_blank" rel="noopener">' +
+        esc(r.website.replace(/^https?:\/\//, '')) + '</a></td>' +
+        '<td>' + esc(r.company) + '</td>' +
+        '<td><span class="pill ' + pill + '">' + esc(r.status) + '</span>' +
+          (r.why ? '<div class="sub" style="margin:4px 0 0">' + esc(r.why) + '</div>' : '') + '</td>' +
+        '<td>' + esc(r.method || '-') + '</td>' +
+        '<td class="mono">' + esc((r.via || '').replace(/^https?:\/\//, '').slice(0, 44)) + '</td>' +
+        '<td class="mono">' + esc(r.when) + '</td></tr>';
+    }).join('') : '<tr><td colspan="6"><div class="empty">Nothing in this group.</div></td></tr>';
+  }
+
+  document.querySelectorAll('.tile.pick').forEach(b => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.tile.pick').forEach(x => x.setAttribute('aria-pressed', x === b));
+      render(b.dataset.f);
+    });
+  });
+</script>
+"""
 
 
 @app.get("/overall")
@@ -748,9 +1242,29 @@ OVERALL_HTML = """<!doctype html>
 """
 
 
+WHY_NOT = {
+    "no_contact_found": "no form and no address published",
+    "unreachable": "site would not load",
+    "timeout": "site took too long",
+    "error": "something went wrong",
+}
+
+
+def _why_not(row) -> str:
+    status = row.get("status")
+    if status == "failed":
+        detail = str(row.get("detail", ""))
+        if "bounced" in detail.lower():
+            return "email bounced - address does not exist"
+        if "smtp" in detail.lower():
+            return "the mail server refused it"
+        return "form submission was rejected"
+    return WHY_NOT.get(status, status or "")
+
+
 @app.get("/contacted")
 def contacted():
-    mails, forms = _contacted_rows()
+    mails, forms, missed = _contacted_rows()
 
     if mails:
         mail_rows = "".join(
@@ -780,10 +1294,23 @@ def contacted():
 
     # Plain substitution, not str.format: the page carries a <script> block
     # whose braces would be read as format fields.
+    if missed:
+        missed_rows = "".join(
+            '<tr><td><strong>{}</strong><br><a href="{}" target="_blank" rel="noopener">{}</a></td>'
+            '<td><span class="pill warn">{}</span></td><td>{}</td>'
+            '<td class="mono">{}</td></tr>'.format(
+                _esc(r.get("company_name")), _esc(r.get("website")), _esc(r.get("website")),
+                _esc(r.get("status")), _esc(_why_not(r)), _when(r))
+            for r in missed)
+    else:
+        missed_rows = ('<tr><td colspan="4"><div class="empty">'
+                       'Every site with a contact route was reached.</div></td></tr>')
+
     page = CONTACTED_HTML
     for token, value in (("{css}", CONTACTED_CSS), ("{n_mail}", str(len(mails))),
-                         ("{n_form}", str(len(forms))), ("{mail_rows}", mail_rows),
-                         ("{form_rows}", form_rows)):
+                         ("{n_form}", str(len(forms))), ("{n_missed}", str(len(missed))),
+                         ("{mail_rows}", mail_rows), ("{form_rows}", form_rows),
+                         ("{missed_rows}", missed_rows)):
         page = page.replace(token, value)
     return page
 
@@ -818,6 +1345,8 @@ CONTACTED_HTML = """<!doctype html>
       Email addresses <span class="count">({n_mail})</span></button>
     <button class="tab" role="tab" id="t-form" aria-selected="false" onclick="pick('form')">
       Contact forms <span class="count">({n_form})</span></button>
+    <button class="tab" role="tab" id="t-missed" aria-selected="false" onclick="pick('missed')">
+      Not reached <span class="count">({n_missed})</span></button>
   </div>
 
   <div class="panel" id="p-mail">
@@ -827,6 +1356,10 @@ CONTACTED_HTML = """<!doctype html>
   <div class="panel" id="p-form" hidden>
     <table><thead><tr><th>Company / site</th><th>Form page</th><th>Filled as</th>
       <th>Status</th><th>Evidence</th><th>When</th></tr></thead><tbody>{form_rows}</tbody></table>
+  </div>
+  <div class="panel" id="p-missed" hidden>
+    <table><thead><tr><th>Company / site</th><th>Status</th><th>Why not reached</th>
+      <th>Last tried</th></tr></thead><tbody>{missed_rows}</tbody></table>
   </div>
 </div>
 <script>

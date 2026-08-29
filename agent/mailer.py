@@ -87,6 +87,13 @@ class Mailer:
         return msg
 
     def send(self, to_addr: str, subject: str, body: str, html: str, sender: dict) -> tuple[str, str]:
+        # email.enabled was only ever a preflight warning, so a config that
+        # said email was off still sent. It is enforced here, at the one place
+        # every send passes through.
+        if not self.cfg.path("email", "enabled", default=True):
+            return "skipped_no_email", ("email sending is switched off "
+                                        f"(email.enabled: false) - {to_addr} not contacted")
+
         # Last line of defence, checked for every send regardless of which
         # mailbox is sending: the lookup is keyed on the recipient, so an
         # address written to by one sender is closed to all of them.
