@@ -32,6 +32,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 from werkzeug.utils import secure_filename
 
+from agent import scripts as pitch_scripts
 from agent.config import Config, default_config_path, load_env_file
 
 ROOT = Path(__file__).resolve().parent
@@ -127,8 +128,48 @@ def _require_auth():
 
 _lock = threading.Lock()
 STATE: dict = {"proc": None, "input": None, "input_path": None, "live": False,
-               "preview": None, "preview_path": None,
+               "preview": None, "preview_path": None, "script": None,
                "started_at": None, "stopped_by_user": False, "restarts": 0}
+
+
+CONFIG_PATH = default_config_path(ROOT)
+
+
+def _script_catalogue() -> tuple[list[dict], str]:
+    """The pitch scripts on offer, read fresh from the config file.
+
+    Re-read rather than taken from the `cfg` loaded at import: adding a script
+    to the config should show up in the picker on the next page load, not only
+    after someone remembers to restart the service.
+    """
+    try:
+        live_cfg = Config.load(CONFIG_PATH)
+    except Exception:          # noqa: BLE001 - a broken config must not blank the console
+        live_cfg = cfg
+    return pitch_scripts.catalogue(live_cfg), pitch_scripts.default_key(live_cfg)
+
+
+def _last_script() -> str:
+    """The pitch the last run used. Survives a restart of this service.
+
+    Resume and "submit dry runs live" continue a batch that was already
+    written with one pitch - carrying on with a different one would put two
+    different letters through the same sheet.
+    """
+    key = STATE.get("script")
+    if key:
+        return str(key)
+    try:
+        return str(json.loads(MODE_FILE.read_text(encoding="utf-8")).get("script") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _script_label(key: str) -> str:
+    for entry in _script_catalogue()[0]:
+        if entry["key"] == key:
+            return entry["label"]
+    return key or ""
 
 
 def _run_report_url() -> str:
@@ -285,10 +326,22 @@ def _status() -> dict:
         "returncode": None if proc is None else proc.poll(),
         "input": STATE["input"],
         "live": STATE["live"],
+        "script": _last_script(),
+        "script_label": _script_label(_last_script()),
         "started_at": STATE["started_at"],
         "report_url": _run_report_url(),
         "report_ready": REPORT_PATH.exists(),
     }
+
+
+@app.get("/scripts")
+def scripts_list():
+    """Which pitch a run can be sent with, for the console's picker."""
+    catalogue, default_key = _script_catalogue()
+    last = _last_script()
+    known = {s["key"] for s in catalogue}
+    return jsonify(scripts=catalogue, default=default_key,
+                   selected=last if last in known else default_key)
 
 
 @app.post("/upload")
@@ -374,7 +427,15 @@ def start():
         headless = bool(data.get("headless", True))
         limit = int(data.get("limit") or 0)
 
-        return start_run(input_path, live, headless, limit)
+        # Checked here as well as in run.py: a rejected pitch should come back
+        # as a message in the console, not as a subprocess that exits 2 and
+        # leaves the dashboard looking like the run merely failed.
+        catalogue, default_key = _script_catalogue()
+        script = str(data.get("script") or "").strip() or default_key
+        if script not in {s["key"] for s in catalogue}:
+            return jsonify(error=f"unknown pitch script {script!r}"), 400
+
+        return start_run(input_path, live, headless, limit, script=script)
 
 
 MAX_RESTARTS = 25          # a ceiling, not an expectation
@@ -521,9 +582,11 @@ def _supervise(argv, log_fh):
 
 
 def start_run(input_path: Path, live: bool, headless: bool, limit: int,
-              continue_batch: bool = False):
+              continue_batch: bool = False, script: str = ""):
     """Launch run.py under supervision. Caller owns the "already running" check."""
     argv = [sys.executable, "run.py", "--input", str(input_path), "--yes"]
+    if script:
+        argv += ["--script", script]
     if continue_batch:
         argv.append("--continue-batch")
     if live:
@@ -544,13 +607,15 @@ def start_run(input_path: Path, live: bool, headless: bool, limit: int,
     # Persist the mode: STATE lives in memory, so after a service restart a
     # Resume was defaulting to a dry run and silently sending nothing.
     try:
-        MODE_FILE.write_text(json.dumps({"live": bool(live), "input": str(input_path)}),
+        MODE_FILE.write_text(json.dumps({"live": bool(live), "input": str(input_path),
+                                         "script": script or ""}),
                              encoding="utf-8")
     except OSError:
         pass
     STATE["preview"] = None          # live results take over from here
     STATE.update(proc=proc, input=input_path.name, input_path=str(input_path),
-                 live=live, started_at=datetime.now().isoformat(timespec="seconds"),
+                 live=live, script=script or None,
+                 started_at=datetime.now().isoformat(timespec="seconds"),
                  stopped_by_user=False, restarts=0)
     threading.Thread(target=_supervise, args=(argv, log_fh), daemon=True).start()
     return jsonify(_status())
@@ -572,7 +637,7 @@ def go_live():
         if path is None:
             return jsonify(error="no previous run to promote - upload a sheet and run it first"), 400
 
-    return start_run(path, live=True, headless=True, limit=0)
+    return start_run(path, live=True, headless=True, limit=0, script=_last_script())
 
 
 @app.post("/clear-drafts")
@@ -712,8 +777,10 @@ def resume():
             except Exception:
                 live = False
         live = bool(live)
+        script = _last_script()
 
-    return start_run(path, live=live, headless=True, limit=0, continue_batch=True)
+    return start_run(path, live=live, headless=True, limit=0, continue_batch=True,
+                     script=script)
 
 
 @app.post("/stop")

@@ -377,18 +377,78 @@ async def collect_emails(page, site_host: str) -> list[str]:
     return clean[:5]
 
 
-async def settle(page, extra_ms: int = 1800) -> None:
-    """Give a JS-rendered page a moment to actually render.
+# What "ready" looks like. A contact form almost always has a message box or an
+# email field; a header search box has neither, so this does not fire on every
+# page that merely contains an <input>. The CAPTCHA selectors count as ready
+# too: the form is there, we simply will not be able to submit it.
+FORM_READY_SEL = (
+    "textarea, input[type=email], "
+    "form input[name*='mail' i], form input[id*='mail' i], "
+    "iframe[src*='recaptcha'], [data-sitekey]"
+)
+# once a field exists, give its siblings a moment to mount alongside it
+FORM_READY_GRACE_MS = 350
+IDLE_CEILING_S = 6.0
+
+
+async def settle(page, extra_ms: int = 1800, adaptive: bool = True) -> None:
+    """Wait until the page has something worth reading.
 
     Reading the DOM immediately after domcontentloaded finds an empty shell on
-    any site that builds its form client-side.
+    any site that builds its form client-side, so some waiting is unavoidable.
+    Waiting a *fixed* time is not: most pages have their form within a tenth of
+    a second, and the rest of the pause is spent on nothing.
+
+    A form field appearing and the network going idle are raced under the same
+    ceiling the fixed wait used, so this can never be slower than waiting the
+    full time - a page that never shows a field still waits it out.
     """
+    if not adaptive:
+        try:
+            await asyncio.wait_for(page.wait_for_load_state("networkidle"),
+                                   timeout=IDLE_CEILING_S)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_timeout(extra_ms)
+        except Exception:
+            pass
+        return
+
+    form = asyncio.ensure_future(
+        page.wait_for_selector(FORM_READY_SEL, state="attached",
+                               timeout=IDLE_CEILING_S * 1000))
+    idle = asyncio.ensure_future(page.wait_for_load_state("networkidle"))
     try:
-        await asyncio.wait_for(page.wait_for_load_state("networkidle"), timeout=6)
+        done, pending = await asyncio.wait(
+            {form, idle}, timeout=IDLE_CEILING_S,
+            return_when=asyncio.FIRST_COMPLETED)
     except Exception:
-        pass
+        done, pending = set(), {form, idle}
+
+    # Whichever lost the race is cancelled, then awaited: a cancelled Playwright
+    # call still has to be collected or it resurfaces later as an unretrieved
+    # exception on an unrelated await. CancelledError is a BaseException, so it
+    # is caught by name - "except Exception" lets it straight through.
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        try:
+            await task
+        except (Exception, asyncio.CancelledError):
+            pass
+
+    ready = False
+    for task in done:                      # never leave an exception unread
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            continue
+        if task is form and exc is None:
+            ready = True
+
     try:
-        await page.wait_for_timeout(extra_ms)
+        await page.wait_for_timeout(FORM_READY_GRACE_MS if ready else extra_ms)
     except Exception:
         pass
 

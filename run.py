@@ -33,6 +33,7 @@ from agent.evidence import Evidence
 from agent.ledger import build_ledger
 from agent.mailer import Mailer
 from agent.report import build_report
+from agent.scripts import apply as apply_script
 from agent.senders import pick_sender
 from agent.sheet import load_rows, write_results
 from agent.state import State, norm_site
@@ -75,9 +76,10 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
     Google Forms...) and every later step has to be scoped to its own document.
     """
     contact_candidates = contact_candidates if contact_candidates is not None else []
+    adaptive = bool(cfg.path("run", "adaptive_settle", default=True))
     last_good_url = page.url  # most recent page that actually loaded (status < 400)
     best = (page, [], page.url)  # always a real page, even if no form is ever found
-    await discovery.settle(page, 900)
+    await discovery.settle(page, 900, adaptive)
     ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
     if ranked and ranked[0][0] >= 60:
         return page, ranked, page.url
@@ -102,12 +104,12 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
         except Exception:
             continue
         last_good_url = page.url
-        await discovery.settle(page)
+        await discovery.settle(page, 1800, adaptive)
         ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if (not ranked or ranked[0][0] < 40):
             # Nothing yet is usually a form that has not mounted, not a page
             # without one. Look once more before writing the page off.
-            await discovery.settle(page, 2000)
+            await discovery.settle(page, 2000, adaptive)
             ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if ranked and ranked[0][0] > best_score:
             best_score, best = ranked[0][0], (page, ranked, page.url)
@@ -141,7 +143,21 @@ async def open_browser(pw, cfg, old_browser=None):
             await old_browser.close()
         except Exception:
             pass
-    browser = await pw.chromium.launch(headless=bool(cfg.path("run", "headless", default=True)))
+    launch: dict = {"headless": bool(cfg.path("run", "headless", default=True))}
+    # an installed browser (msedge, chrome) rather than the one Playwright ships
+    channel = str(cfg.path("run", "browser_channel", default="") or "").strip()
+    if channel:
+        launch["channel"] = channel
+    try:
+        browser = await pw.chromium.launch(**launch)
+    except Exception as exc:
+        if not channel:
+            raise
+        # a machine without that browser should still run, not stop dead
+        print(f"    ! {channel} could not be launched ({exc}); "
+              f"falling back to the bundled browser", flush=True)
+        launch.pop("channel")
+        browser = await pw.chromium.launch(**launch)
     context = await browser.new_context(
         user_agent=UA, viewport={"width": 1440, "height": 960},
         locale="en-US", ignore_https_errors=True,
@@ -194,8 +210,13 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
 
     timeout = int(cfg.path("run", "page_timeout_ms", default=30000))
     retries = int(cfg.path("run", "nav_retries", default=2))
+    # Opening the site has its own, shorter ceiling: a dead host otherwise burns
+    # this twice over before we learn anything. Everything after it - waiting for
+    # a field, a click, a confirmation - keeps the full timeout, because those
+    # happen on pages that have already proved they load.
+    nav_timeout = int(cfg.path("run", "nav_timeout_ms", default=0) or timeout)
 
-    page, err = await open_page(context, url, timeout, retries)
+    page, err = await open_page(context, url, nav_timeout, retries)
     if err:
         result.update(method="none", status="unreachable", detail=err)
         await page.close()
@@ -420,6 +441,17 @@ async def main_async(args) -> int:
     logfile = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log"))
     logfile.parent.mkdir(parents=True, exist_ok=True)
 
+    # Which pitch this sheet gets. Applied before any template path is read,
+    # and fatal if unknown - the wrong pitch reaching a targeted sheet cannot
+    # be taken back, so a typo stops the run instead of silently using the
+    # default one.
+    try:
+        script_key, script_label = apply_script(cfg, args.script)
+    except ValueError as exc:
+        log(f"REFUSING to run: {exc}", logfile)
+        return 2
+    log(f"script: {script_label} ({script_key})", logfile)
+
     placeholders = identity_placeholders(cfg)
     if placeholders:
         log("-" * 72, logfile)
@@ -569,97 +601,136 @@ async def main_async(args) -> int:
                 os._exit(3)
 
     async with async_playwright() as pw:
-        browser, context = await open_browser(pw, cfg)
         watch = asyncio.create_task(watchdog())
         recycle_every = int(cfg.path("run", "recycle_browser_every", default=50))
         max_consecutive = int(cfg.path("run", "max_consecutive_errors", default=6))
-        consecutive_errors = 0
-        since_recycle = 0
+        workers = max(1, int(cfg.path("run", "workers", default=1)))
+        workers = min(workers, len(rows)) or 1
 
-        for n, row in enumerate(rows, 1):
-            if state.sent_today(today) >= daily_cap:
-                log(f"daily email cap ({daily_cap}) reached - stopping", logfile)
-                break
+        # The queue is the only thing the workers share about *what* to do, so a
+        # slow site holds up its own worker and nobody else.
+        queue: asyncio.Queue = asyncio.Queue()
+        for item in enumerate(rows, 1):
+            queue.put_nowait(item)
 
-            # Long batches leak browser memory until Chromium falls over, so
-            # retire it on a schedule rather than waiting for the crash.
-            if recycle_every and since_recycle >= recycle_every:
-                log(f"recycling browser after {since_recycle} sites", logfile)
-                browser, context = await open_browser(pw, cfg, browser)
-                since_recycle = 0
+        done_count = 0          # sites finished, for progress and the row dump
+        consecutive_errors = 0  # reset by any success: this catches "everything
+                                # is failing", not "these particular sites failed"
+        stop = asyncio.Event()  # circuit breaker / daily cap, seen by every worker
 
-            log(f"[{n}/{len(rows)}] {row['website']}", logfile)
-            res = None
-            for attempt in (1, 2):
-                if not browser.is_connected():
-                    log("    browser is not connected - relaunching", logfile)
-                    browser, context = await open_browser(pw, cfg, browser)
-                try:
-                    # No single site may hold up the batch. Bounded work can
-                    # still add up past this (nav retries x contact-page
-                    # candidates), and a wedged page can block in ways the
-                    # browser timeout does not cover, so the whole per-site
-                    # pipeline gets one ceiling.
-                    res = await asyncio.wait_for(
-                        process(row, context, cfg, env, mailer, ev, args, logfile, state),
-                        timeout=site_timeout,
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    res = _row_result(row, "timeout",
-                                      f"site exceeded run.site_timeout_s ({site_timeout:.0f}s) - skipped")
-                    await _close_stray_pages(context)
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    # A dead browser is worth one relaunch and one retry - the
-                    # site itself was never really attempted. Anything else is
-                    # this site's own failure.
-                    if attempt == 1 and not browser.is_connected():
-                        log(f"    browser died ({type(exc).__name__}) - relaunching, retrying this site",
-                            logfile)
+        if workers > 1:
+            log(f"running {workers} sites at a time", logfile)
+
+        async def run_worker(wid: int):
+            nonlocal done_count, consecutive_errors
+            browser, context = await open_browser(pw, cfg)
+            since_recycle = 0
+            tag = f"w{wid} " if workers > 1 else ""
+            try:
+                while not stop.is_set():
+                    try:
+                        n, row = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    if state.sent_today(today) >= daily_cap:
+                        log(f"daily email cap ({daily_cap}) reached - stopping", logfile)
+                        stop.set()
+                        break
+
+                    # Long batches leak browser memory until Chromium falls over,
+                    # so retire it on a schedule rather than waiting for the crash.
+                    if recycle_every and since_recycle >= recycle_every:
+                        log(f"{tag}recycling browser after {since_recycle} sites", logfile)
                         browser, context = await open_browser(pw, cfg, browser)
                         since_recycle = 0
-                        continue
-                    res = _row_result(row, "error", f"{type(exc).__name__}: {str(exc)[:200]}")
-                    break
 
-            heartbeat["at"] = time.time()
-            results.append(res)
-            state.record(row["website"], res)
-            since_recycle += 1
-            log(f"    -> {res['method'] or '-'} / {res['status']} :: {res['detail'][:110]}", logfile)
-            # This sheet's own numbers - not the running total across every
-            # sheet ever uploaded, which is what the overall dashboard is for.
-            build_report(dup_skips + results, report_mode, report_path)
-            # Rebuilt here rather than only at the end: every run since the 27th
-            # was stopped or wedged before the final build, leaving the overall
-            # dashboard two days stale.
-            build_report(list(state.data.values()), report_mode,
-                         cfg.resolve(cfg.path("paths", "report_all_path",
-                                              default="output/report_all.html")))
-            _dump_rows(cfg, dup_skips + results, report_mode,
-                       len(dup_skips) + len(rows), len(dup_skips) + n)
+                    log(f"{tag}[{n}/{len(rows)}] {row['website']}", logfile)
+                    res = None
+                    for attempt in (1, 2):
+                        if not browser.is_connected():
+                            log(f"{tag}    browser is not connected - relaunching", logfile)
+                            browser, context = await open_browser(pw, cfg, browser)
+                        try:
+                            # No single site may hold up the batch. Bounded work
+                            # can still add up past this (nav retries x
+                            # contact-page candidates), and a wedged page can
+                            # block in ways the browser timeout does not cover,
+                            # so the whole per-site pipeline gets one ceiling.
+                            res = await asyncio.wait_for(
+                                process(row, context, cfg, env, mailer, ev, args, logfile, state),
+                                timeout=site_timeout,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            res = _row_result(row, "timeout",
+                                              f"site exceeded run.site_timeout_s ({site_timeout:.0f}s) - skipped")
+                            await _close_stray_pages(context)
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            # A dead browser is worth one relaunch and one retry -
+                            # the site itself was never really attempted. Anything
+                            # else is this site's own failure.
+                            if attempt == 1 and not browser.is_connected():
+                                log(f"{tag}    browser died ({type(exc).__name__}) - relaunching, "
+                                    f"retrying this site", logfile)
+                                browser, context = await open_browser(pw, cfg, browser)
+                                since_recycle = 0
+                                continue
+                            res = _row_result(row, "error", f"{type(exc).__name__}: {str(exc)[:200]}")
+                            break
 
-            # Burning through the rest of the sheet recording failures is worse
-            # than stopping: the rows look attempted when they never were.
-            consecutive_errors = consecutive_errors + 1 if res["status"] == "error" else 0
-            if max_consecutive and consecutive_errors >= max_consecutive:
-                log(f"stopping - {consecutive_errors} sites failed in a row, something is wrong. "
-                    f"Remaining rows left untouched so a re-run can retry them.", logfile)
-                break
+                    # Everything from here to the end of the loop body runs
+                    # without an await, so another worker cannot interleave
+                    # part-way through and corrupt the state file or the counts.
+                    heartbeat["at"] = time.time()
+                    results.append(res)
+                    state.record(row["website"], res)
+                    since_recycle += 1
+                    done_count += 1
+                    log(f"{tag}    -> {res['method'] or '-'} / {res['status']} "
+                        f":: {res['detail'][:110]}", logfile)
+                    # This sheet's own numbers - not the running total across every
+                    # sheet ever uploaded, which is what the overall dashboard is for.
+                    build_report(dup_skips + results, report_mode, report_path)
+                    # Rebuilt here rather than only at the end: every run since the
+                    # 27th was stopped or wedged before the final build, leaving the
+                    # overall dashboard two days stale.
+                    build_report(list(state.data.values()), report_mode,
+                                 cfg.resolve(cfg.path("paths", "report_all_path",
+                                                      default="output/report_all.html")))
+                    _dump_rows(cfg, dup_skips + results, report_mode,
+                               len(dup_skips) + len(rows), len(dup_skips) + done_count)
 
-            if n < len(rows):
-                await asyncio.sleep(jitter(cfg.path("run", "delay_between_sites"), (8, 20)))
+                    # Burning through the rest of the sheet recording failures is
+                    # worse than stopping: the rows look attempted when they never
+                    # were. Any success clears it, so this fires on a broken run,
+                    # not on a patch of broken sites.
+                    consecutive_errors = consecutive_errors + 1 if res["status"] == "error" else 0
+                    if max_consecutive and consecutive_errors >= max_consecutive:
+                        log(f"stopping - {consecutive_errors} sites failed in a row, something "
+                            f"is wrong. Remaining rows left untouched so a re-run can retry them.",
+                            logfile)
+                        stop.set()
+                        break
 
+                    if not queue.empty():
+                        await asyncio.sleep(jitter(cfg.path("run", "delay_between_sites"), (8, 20)))
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+        await asyncio.gather(*(run_worker(i + 1) for i in range(workers)),
+                             return_exceptions=True)
+        # results arrive in completion order; the sheet's order is what readers expect
+        results.sort(key=lambda r: r.get("row_index", 0))
         watch.cancel()
-        try:
-            await context.close()
-        except Exception:
-            pass
-        try:
-            await browser.close()
-        except Exception:
-            pass
 
     mailer.close()
     out = write_results(dup_skips + results, cfg.resolve(cfg.path("paths", "results_path")))
@@ -698,6 +769,9 @@ def parse_args(argv=None):
     p.add_argument("--continue-batch", action="store_true",
                    help="carry on where a stopped run left off: skip every row already "
                         "attempted, dry runs included")
+    p.add_argument("--script", default="",
+                   help="pitch script to use, by key (see scripts: in the config). "
+                        "Default: the config's default_script")
     p.add_argument("--yes", action="store_true", help="skip the live-mode confirmation prompt")
     return p.parse_args(argv)
 
