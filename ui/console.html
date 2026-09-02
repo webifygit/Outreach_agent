@@ -270,6 +270,25 @@ button:disabled { opacity: .42; cursor: not-allowed; }
 }
 .inline-row button { flex: 1 1 auto; }
 
+/* --- pitch script picker ------------------------------------------------ */
+.picker { padding: 12px 0 2px; border-bottom: 1px solid var(--edge-soft); }
+.picker .lab { color: var(--ink-2); font-size: 13px; }
+.picker .sub { display: block; color: var(--ink-3); font-size: 11px; margin-top: 2px; }
+.script-opts { display: grid; gap: 7px; margin-top: 10px; }
+.script-opt {
+  display: block; width: 100%; text-align: left; padding: 10px 12px;
+  border: 1px solid var(--edge); background: rgba(129,140,248,.06); color: var(--ink-2);
+  font: 600 12.5px Inter, sans-serif; border-radius: 11px;
+}
+.script-opt:hover:not(:disabled) { background: rgba(129,140,248,.14); }
+.script-opt .blurb { display: block; margin-top: 3px; font-weight: 500; font-size: 11px; color: var(--ink-3); }
+.script-opt[aria-pressed="true"] {
+  background: var(--brand); border-color: transparent; color: #fff;
+  box-shadow: 0 8px 22px rgba(99,102,241,.30);
+}
+.script-opt[aria-pressed="true"] .blurb { color: rgba(255,255,255,.8); }
+.script-opt:disabled { opacity: .42; cursor: not-allowed; }
+
 /* --- metric tiles ------------------------------------------------------- */
 .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .tile {
@@ -518,6 +537,15 @@ tbody tr:hover { transform: translateX(2px); }
     background: linear-gradient(135deg, #0891B2, #4F46E5); color: #fff;
     border-color: transparent; box-shadow: 0 6px 18px rgba(8,145,178,.28);
   }
+  :root[data-theme="light"] .script-opt {
+    background: #F1F3FA; color: #1F2A44; border-color: rgba(15,23,42,.14);
+  }
+  :root[data-theme="light"] .script-opt[aria-pressed="true"],
+  :root[data-theme="light"] .script-opt[aria-pressed="true"]:hover:not(:disabled) {
+    background: linear-gradient(100deg, #7C3AED, #6366F1 55%, #4F46E5); color: #fff;
+    border-color: transparent; box-shadow: 0 6px 18px rgba(99,102,241,.28);
+  }
+  :root[data-theme="light"] .script-opt[aria-pressed="true"] .blurb { color: rgba(255,255,255,.85); }
   :root[data-theme="light"] .b-clear {
     background: #FEF3C7; color: #92400E; border-color: #FCD34D; font-weight: 600;
   }
@@ -614,6 +642,7 @@ tbody tr:hover { transform: translateX(2px); }
       <span class="chip" id="runChip"><span class="dot pulse" id="runDot"></span><b id="runText">IDLE</b></span>
       <span class="chip"><span class="dot" id="modeDot"></span><b id="modeText">DRY RUN</b></span>
       <span class="chip"><span class="k">Input</span><b id="inputName">-</b></span>
+      <span class="chip" title="The wording the next run will send"><span class="k">Pitch</span><b id="scriptName">-</b></span>
       <span class="chip"><span class="k">Started</span><b id="startedAt">-</b></span>
       <span class="chip"><span class="k">Rows</span><b id="rowCount">0</b></span>
       <span class="chip"><span class="k">Dry runs</span><b id="dryCount">0</b></span>
@@ -640,17 +669,25 @@ tbody tr:hover { transform: translateX(2px); }
         <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.tsv" hidden>
         <div class="file-chip" id="fileChip"></div>
 
+        <div class="picker">
+          <span class="lab">Pitch script
+            <span class="sub">which wording this sheet gets - match it to who is in the sheet</span></span>
+          <div class="script-opts" id="scriptOpts">
+            <div class="empty" style="font-size:11px">Loading…</div>
+          </div>
+        </div>
+
         <div class="row" style="margin-top:6px">
           <span class="lab">Live mode<span class="sub">Sends emails and submits forms</span></span>
-          <label class="switch"><input type="checkbox" id="live"><span class="track"></span><span class="knob"></span></label>
+          <label class="switch"><input type="checkbox" id="live" autocomplete="off"><span class="track"></span><span class="knob"></span></label>
         </div>
         <div class="row">
-          <span class="lab">Show browser window</span>
-          <label class="switch"><input type="checkbox" id="showBrowser"><span class="track"></span><span class="knob"></span></label>
+          <span class="lab">Show browser window <span class="sub">one window per site - for watching a few</span></span>
+          <label class="switch"><input type="checkbox" id="showBrowser" autocomplete="off"><span class="track"></span><span class="knob"></span></label>
         </div>
         <div class="row">
           <span class="lab">Limit rows <span class="sub">0 = all</span></span>
-          <input type="number" id="limit" min="0" value="0">
+          <input type="number" id="limit" min="0" value="0" autocomplete="off">
         </div>
 
         <div class="btns">
@@ -931,6 +968,16 @@ async function refresh() {
   stopBtn.disabled = !running;
   startBtn.disabled = running || !uploadedPath;
 
+  // the wording is fixed once a run starts - show the one it is actually
+  // sending, and don't let a click suggest otherwise mid-run
+  if (running && s.script) {
+    if (s.script_label) scriptLabels[s.script] = s.script_label;
+    scriptKey = s.script;
+    markSelected();
+  }
+  document.querySelectorAll('.script-opt').forEach(b => { b.disabled = running; });
+  paintScriptChip();
+
   // bounce check runs on its own thread; mirror it on the button
   const bounce = s.bounce || {};
   const bBtn = $('bounceBtn');
@@ -1069,6 +1116,49 @@ async function upload(file) {
   } catch (e) { toast('Upload failed', String(e), 'err'); }
 }
 
+/* ---------- pitch script --------------------------------------------------- */
+let scriptKey = '';
+const scriptLabels = {};
+
+function scriptLabel(key) { return scriptLabels[key] || key || '-'; }
+
+function paintScriptChip() { $('scriptName').textContent = scriptLabel(scriptKey); }
+
+function markSelected() {
+  document.querySelectorAll('.script-opt').forEach(b => {
+    b.setAttribute('aria-pressed', String(b.dataset.key === scriptKey));
+  });
+}
+
+function selectScript(key) {
+  if (!key || key === scriptKey) return;
+  scriptKey = key;
+  markSelected();
+  paintScriptChip();
+}
+
+async function loadScripts() {
+  let data;
+  try { data = await (await fetch('/scripts')).json(); } catch (e) { return; }
+  const list = data.scripts || [];
+  const box = $('scriptOpts');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty" style="font-size:11px">No pitch scripts configured.</div>';
+    return;
+  }
+  list.forEach(s => { scriptLabels[s.key] = s.label; });
+  // the server preselects the pitch the last run used, so continuing a sheet
+  // and starting it again stay on the same wording unless someone changes it
+  scriptKey = data.selected || data.default || list[0].key;
+  box.innerHTML = list.map(s => `<button type="button" class="script-opt" data-key="${esc(s.key)}"
+      aria-pressed="${s.key === scriptKey}" title="${esc(s.blurb || s.label)}">${esc(s.label)}${
+        s.blurb ? `<span class="blurb">${esc(s.blurb)}</span>` : ''}</button>`).join('');
+  box.querySelectorAll('.script-opt').forEach(btn => {
+    btn.addEventListener('click', () => selectScript(btn.dataset.key));
+  });
+  paintScriptChip();
+}
+
 /* ---------- run controls -------------------------------------------------- */
 async function post(url, body) {
   const res = await fetch(url, {
@@ -1082,18 +1172,28 @@ async function post(url, body) {
 startBtn.addEventListener('click', async () => {
   if (!uploadedPath) return;
   const live = $('live').checked;
-  if (live && !confirm('Live mode is ON.\n\nContact forms will be submitted and emails sent for real. Continue?')) return;
+  if (live && !confirm('Live mode is ON.\n\nContact forms will be submitted and emails sent for real, using the "' + scriptLabel(scriptKey) + '" pitch.\n\nContinue?')) return;
+  // a visible browser is fine for a handful of sites and miserable for a sheet
+  if ($('showBrowser').checked) {
+    const rows = parseInt($('limit').value || '0', 10);
+    if (!confirm('"Show browser window" is ON.\n\nA browser window will open for '
+        + (rows ? 'each of the ' + rows + ' sites' : 'every site in the sheet')
+        + ', one after another. Turn it off unless you are watching a few sites on purpose.\n\n'
+        + 'Start anyway?')) return;
+  }
   startBtn.disabled = true;
   startBtn.innerHTML = 'Starting <span class="dots"><i></i><i></i><i></i></span>';
   const data = await post('/start', {
     input: uploadedPath, live,
     headless: !$('showBrowser').checked,
-    limit: parseInt($('limit').value || '0', 10)
+    limit: parseInt($('limit').value || '0', 10),
+    script: scriptKey
   });
   startBtn.innerHTML = '▶ Start';
   if (data.error) { toast('Could not start', data.error, 'err'); startBtn.disabled = false; return; }
   seenRows = 0;
-  toast('Run started', live ? 'Live mode - sending for real' : 'Dry run - nothing will be sent', 'ok');
+  toast('Run started', (live ? 'Live mode - sending for real' : 'Dry run - nothing will be sent')
+        + ' - ' + scriptLabel(scriptKey) + ' pitch', 'ok');
   startPolling();
 });
 
@@ -1169,6 +1269,17 @@ $('clearBtn').addEventListener('click', async () => {
 /* ---------- theme --------------------------------------------------------- */
 const themeToggle = $('themeToggle');
 try {
+  // a reload must not silently restore this - it has started runs by accident
+  const sb = $('showBrowser');
+  if (sb) {
+    sb.checked = false;
+    sb.addEventListener('change', () => {
+      if (sb.checked) toast('Browser windows will open',
+                            'One window per site. Fine for watching a few, not for a full sheet.', 'warn');
+    });
+  }
+  if ($('live')) $('live').checked = false;
+
   if (localStorage.getItem('webifyTheme') === 'light') {
     document.documentElement.setAttribute('data-theme', 'light');
     themeToggle.checked = true;
@@ -1181,6 +1292,7 @@ themeToggle.addEventListener('change', () => {
 });
 
 /* ---------- go ------------------------------------------------------------ */
+loadScripts();
 refresh();
 setInterval(refresh, 5000);
 </script>
