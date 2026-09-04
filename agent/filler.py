@@ -31,6 +31,7 @@ ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("message",   re.compile(r"message|comment|enquir|inquir|detail|describe|question|"
                              r"requirement|project|how can we help|tell us|body|content|brief")),
     ("name",      re.compile(r"\bname\b|full[ _-]?name|your name|contact person")),
+    ("postcode",  re.compile(r"zip|postal|post ?code|postcode|pin ?code|eircode")),
     ("city",      re.compile(r"\bcity\b|town|location")),
     ("country",   re.compile(r"country|nation")),
     ("budget",    re.compile(r"budget|price range|investment")),
@@ -147,6 +148,10 @@ def values_for(cfg, ctx: dict, message: str, subject: str) -> dict[str, str]:
         "website": s.get("website", ""),
         "city": s.get("city", ""),
         "country": s.get("country", ""),
+        # A required zip field left blank fails the whole submission - and it is
+        # required far more often than it looks, especially on US service sites
+        # that route enquiries by area.
+        "postcode": s.get("postcode", ""),
         "subject": subject,
         "message": message,
         "budget": "",

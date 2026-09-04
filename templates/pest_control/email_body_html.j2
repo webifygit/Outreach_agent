@@ -1,12 +1,12 @@
 <div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #1f2937; line-height: 1.6; max-width: 600px;">
   <p>Hi <strong>{{ greeting_name or "Team" }}</strong>,</p>
 
-  <p>I'm <strong>{{ sender.first_name }}</strong> from <strong>{{ sender.company }}</strong>.</p>
+  <p>I'm <strong>{{ sender.first_name }}</strong> from <strong>{{ sender.brand or sender.company }}</strong>.</p>
 
   <p>I came across your business and wanted to reach out as we work with businesses in the <strong>pest control industry</strong> across website development, SEO, AEO/GEO, paid marketing, and overall digital growth.</p>
 
   <p>We recently designed and developed the website for <strong>Pest Stop Control</strong>, a UK-based pest control business, and continue to support them with their digital marketing and growth:<br>
-  <a href="https://www.peststopcontrol.com/" style="color:#2563eb;">https://www.peststopcontrol.com/</a></p>
+  <a href="{{ sender.landing_page }}" style="color:#2563eb;">{{ sender.landing_page }}</a></p>
 
   <p>Based on this experience, we'd love to explore how we could support your business as well &mdash; from improving your website and local search visibility to generating more qualified enquiries through organic and paid channels.</p>
   {%- if ai_hook %}
@@ -45,7 +45,7 @@
           <a href="{{ sender.website }}" style="color: #2563eb; text-decoration: underline;">{{ sender.company }}</a>
         </div>
         <div style="margin-top: 8px; font-size: 13px; font-weight: 700;">
-          <a href="https://www.peststopcontrol.com/" style="color: #1e2a4a; text-decoration: none;">Recent work: Pest Stop Control</a>
+          <a href="{{ sender.landing_page }}" style="color: #1e2a4a; text-decoration: none;">AI Agent &amp; Automation Solutions for South African Businesses</a>
         </div>
         <div style="margin-top: 2px; font-size: 12px; color: #6b7280; max-width: 430px;">Website design and development, plus ongoing SEO and digital marketing for a UK pest control business.</div>
       </td>

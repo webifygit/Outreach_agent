@@ -18,6 +18,9 @@ import asyncio
 import json
 import os
 import random
+import shutil
+import signal
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -31,6 +34,7 @@ from agent.config import (Config, default_config_path, identity_placeholders,
                           jitter, load_env_file, placeholder_advice)
 from agent.evidence import Evidence
 from agent.ledger import build_ledger
+from agent.outcomes import build_outcomes
 from agent.mailer import Mailer
 from agent.report import build_report
 from agent.scripts import apply as apply_script
@@ -130,6 +134,42 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
     return best
 
 
+# Browser launches are serialised so a launch can be attributed to the worker
+# that asked for it: the only handle on an individual browser process is the
+# set of driver children that appeared while it was starting, and concurrent
+# launches make that ambiguous. Launches are rare (startup, recycle, relaunch)
+# and take about a second, so the contention costs nothing.
+_LAUNCH_LOCK = asyncio.Lock()
+
+
+def _driver_pid(pw) -> int:
+    """PID of the node driver every browser in this run is a child of.
+
+    Playwright internals, so it is guarded: losing it costs the per-worker kill
+    and nothing else - the run falls back to the whole-process watchdog.
+    """
+    try:
+        return pw.chromium._impl_obj._connection._transport._proc.pid
+    except Exception:
+        return 0
+
+
+def _child_pids(pid: int) -> set[int]:
+    if not pid:
+        return set()
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,ppid="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return set()
+    kids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) == pid:
+            kids.add(int(parts[0]))
+    return kids
+
+
 async def open_browser(pw, cfg, old_browser=None):
     """Launch a fresh browser + context, discarding any previous one.
 
@@ -139,8 +179,12 @@ async def open_browser(pw, cfg, old_browser=None):
     recording failures for sites it never actually visited.
     """
     if old_browser is not None:
+        # A browser that has stopped responding does not answer close() either,
+        # so this is bounded. Leaving it is safe: the caller only ever discards
+        # a browser it has already given up on, and the watchdog SIGKILLs the
+        # process when it was wedged.
         try:
-            await old_browser.close()
+            await asyncio.wait_for(old_browser.close(), timeout=20)
         except Exception:
             pass
     launch: dict = {"headless": bool(cfg.path("run", "headless", default=True))}
@@ -148,22 +192,29 @@ async def open_browser(pw, cfg, old_browser=None):
     channel = str(cfg.path("run", "browser_channel", default="") or "").strip()
     if channel:
         launch["channel"] = channel
-    try:
-        browser = await pw.chromium.launch(**launch)
-    except Exception as exc:
-        if not channel:
-            raise
-        # a machine without that browser should still run, not stop dead
-        print(f"    ! {channel} could not be launched ({exc}); "
-              f"falling back to the bundled browser", flush=True)
-        launch.pop("channel")
-        browser = await pw.chromium.launch(**launch)
+    async with _LAUNCH_LOCK:
+        drv = _driver_pid(pw)
+        before = _child_pids(drv)
+        try:
+            browser = await asyncio.wait_for(pw.chromium.launch(**launch), timeout=45)
+        except Exception as exc:
+            if not channel:
+                raise
+            # a machine without that browser should still run, not stop dead
+            print(f"    ! {channel} could not be launched ({exc}); "
+                  f"falling back to the bundled browser", flush=True)
+            launch.pop("channel")
+            browser = await asyncio.wait_for(pw.chromium.launch(**launch), timeout=45)
+        # exactly one new child means we know which process is this browser;
+        # anything else and we simply go without a pid for it
+        fresh = _child_pids(drv) - before
+        browser_pid = fresh.pop() if len(fresh) == 1 else 0
     context = await browser.new_context(
         user_agent=UA, viewport={"width": 1440, "height": 960},
         locale="en-US", ignore_https_errors=True,
     )
     context.set_default_timeout(int(cfg.path("run", "page_timeout_ms", default=30000)))
-    return browser, context
+    return browser, context, browser_pid
 
 
 def _row_result(row, status: str, detail: str, method: str = "none") -> dict:
@@ -182,8 +233,10 @@ async def _close_stray_pages(context) -> None:
     except Exception:
         return
     for page in pages:
+        # bounded for the same reason as above - this runs right after a site
+        # timed out, i.e. on a browser that may never answer again
         try:
-            await page.close()
+            await asyncio.wait_for(page.close(), timeout=10)
         except Exception:
             pass
 
@@ -496,8 +549,26 @@ async def main_async(args) -> int:
     if limit:
         rows = rows[:limit]
 
-    state = State(cfg.resolve(cfg.path("paths", "state_path", default="output/state.json")),
-                  dedupe_scope=str(cfg.path("run", "dedupe_scope", default="host")))
+    state_path = cfg.resolve(cfg.path("paths", "state_path", default="output/state.json"))
+    # state.json is the only record of who has been contacted and cannot be
+    # rebuilt. Existing backups fire only before destructive actions, so a run
+    # that corrupts it mid-campaign has no recovery point. Snapshot first,
+    # keep the last 20.
+    if state_path.exists():
+        snaps = state_path.parent / "state_snapshots"
+        snaps.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(state_path, snaps / f"state_{datetime.now():%Y%m%d_%H%M%S}.json")
+        old_snaps = sorted(snaps.glob("state_*.json"))[:-20]
+        for stale in old_snaps:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        log(f"state snapshot taken ({len(sorted(snaps.glob('state_*.json')))} kept)", logfile)
+
+    state = State(state_path,
+                  dedupe_scope=str(cfg.path("run", "dedupe_scope", default="host")),
+                  sheet=Path(args.input).name)
     # Re-uploading a sheet must not make already-approached rows disappear: they
     # are carried through as their own list, into the results file, the
     # dashboard and the ledger. Deliberately NOT written back into state - that
@@ -538,6 +609,37 @@ async def main_async(args) -> int:
                 log(f"    and {len(dup_skips) - 8} more", logfile)
         rows = fresh
 
+    # Sites known to wedge the browser. Each one costs a watchdog kill and a
+    # full process restart - every worker loses its place, not just the one
+    # that hit it - so skipping them is far cheaper than attempting them. They
+    # are recorded, not silently dropped, so the sheet still accounts for them.
+    blocked: list[dict] = []
+    skip_hosts = {norm_site(u, scope)
+                  for u in (cfg.path("run", "skip_sites", default=[]) or [])}
+    if skip_hosts:
+        keep = []
+        for r in rows:
+            if norm_site(r["website"], scope) in skip_hosts:
+                blocked.append({
+                    "row_index": r["row_index"], "website": r["website"],
+                    "company_name": r["company_name"],
+                    "method": "none", "status": "skipped_blocked",
+                    "detail": "on run.skip_sites - this site wedges the browser; "
+                              "skipped so it cannot stall the batch",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                })
+            else:
+                keep.append(r)
+        if blocked:
+            log(f"{len(blocked)} site(s) skipped by run.skip_sites", logfile)
+        rows = keep
+
+    # Rows this sheet no longer has to visit because an earlier attempt already
+    # covered them. They leave `rows`, so without carrying the number forward
+    # the progress counter restarts from zero against a shrinking total on every
+    # resume - which reads as work being lost when nothing has been.
+    carried_over = 0
+
     if getattr(args, "continue_batch", False):
         # Picking up a batch that stopped: anything with a record was already
         # visited, whatever the outcome, so start from the first row that has
@@ -547,11 +649,13 @@ async def main_async(args) -> int:
         pending = [r for r in rows if norm_site(r["website"], scope) not in seen_hosts]
         log(f"continuing batch: {len(rows) - len(pending)} row(s) already attempted, "
             f"{len(pending)} to go", logfile)
+        carried_over = len(rows) - len(pending)
         rows = pending
     elif cfg.path("run", "resume", default=True) and not args.no_resume:
         pending = [r for r in rows if not state.is_done(r["website"])]
         if len(pending) < len(rows):
             log(f"resume: skipping {len(rows) - len(pending)} already-processed rows", logfile)
+        carried_over = len(rows) - len(pending)
         rows = pending
 
 
@@ -621,9 +725,61 @@ async def main_async(args) -> int:
         if workers > 1:
             log(f"running {workers} sites at a time", logfile)
 
+        # Per-worker liveness. The whole-process watchdog above is a blunt
+        # instrument - it kills every worker because one is stuck, and the run
+        # loses its place four times over. This one kills just the wedged
+        # worker's browser process, which makes its hung Playwright call raise
+        # TargetClosedError (measured: within 3s), so that worker records the
+        # site and carries on. The others never notice.
+        beats: dict[int, dict] = {}
+
+        async def worker_watchdog():
+            # Normally 1.5x the per-site ceiling, so asyncio's own timeout gets
+            # first refusal and this only acts when that fails to cancel - which
+            # is the case it exists for. Configurable so it can be tested, and
+            # tuned if a machine turns out to wedge differently.
+            grace = float(cfg.path("run", "worker_stall_grace_s",
+                                   default=0) or 0) or max(60.0, site_timeout * 1.5)
+            while True:
+                await asyncio.sleep(10)
+                now = time.time()
+                for wid, hb in list(beats.items()):
+                    # A worker that has finished is not stuck. Everything else
+                    # is fair game - including shutdown, which is where the
+                    # integration test found it hanging on context.close() with
+                    # no site set. No pid means we could not identify this
+                    # browser's process, so leave it to the process watchdog.
+                    if hb.get("done") or not hb.get("pid") or hb.get("killed"):
+                        continue
+                    stuck = now - hb["at"]
+                    if stuck > grace:
+                        where = hb.get("site") or "shutting down"
+                        log(f"w{wid} has been stuck on {where} for {stuck:.0f}s - killing "
+                            f"its browser (pid {hb['pid']}); the other workers carry on",
+                            logfile)
+                        hb["killed"] = True
+                        try:
+                            os.kill(hb["pid"], signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+
+        beat_watch = asyncio.create_task(worker_watchdog())
+
         async def run_worker(wid: int):
             nonlocal done_count, consecutive_errors
-            browser, context = await open_browser(pw, cfg)
+            browser = context = None
+            for attempt in range(1, 4):
+                try:
+                    browser, context, bpid = await open_browser(pw, cfg)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    log(f"w{wid} could not start a browser ({type(exc).__name__}) - "
+                        f"attempt {attempt}/3", logfile)
+                    await asyncio.sleep(5)
+            if browser is None:
+                log(f"w{wid} gave up starting a browser - running without this worker", logfile)
+                return
+            beats[wid] = {"at": time.time(), "site": "", "pid": bpid, "killed": False}
             since_recycle = 0
             tag = f"w{wid} " if workers > 1 else ""
             try:
@@ -642,15 +798,18 @@ async def main_async(args) -> int:
                     # so retire it on a schedule rather than waiting for the crash.
                     if recycle_every and since_recycle >= recycle_every:
                         log(f"{tag}recycling browser after {since_recycle} sites", logfile)
-                        browser, context = await open_browser(pw, cfg, browser)
+                        browser, context, bpid = await open_browser(pw, cfg, browser)
+                        beats[wid].update(pid=bpid, killed=False)
                         since_recycle = 0
 
                     log(f"{tag}[{n}/{len(rows)}] {row['website']}", logfile)
+                    beats[wid].update(at=time.time(), site=row["website"])
                     res = None
                     for attempt in (1, 2):
                         if not browser.is_connected():
                             log(f"{tag}    browser is not connected - relaunching", logfile)
-                            browser, context = await open_browser(pw, cfg, browser)
+                            browser, context, bpid = await open_browser(pw, cfg, None)
+                            beats[wid].update(pid=bpid, killed=False)
                         try:
                             # No single site may hold up the batch. Bounded work
                             # can still add up past this (nav retries x
@@ -668,13 +827,26 @@ async def main_async(args) -> int:
                             await _close_stray_pages(context)
                             break
                         except Exception as exc:  # noqa: BLE001
+                            if beats[wid].get("killed"):
+                                # Our own watchdog killed this browser because this
+                                # site wedged it. Retrying would wedge the fresh one
+                                # too, so record it and move on - that is the whole
+                                # point of killing one worker instead of the run.
+                                res = _row_result(row, "timeout",
+                                                  "this site wedged the browser; it was killed "
+                                                  "and the site skipped so the batch could go on")
+                                browser, context, bpid = await open_browser(pw, cfg, None)
+                                beats[wid].update(at=time.time(), site="", pid=bpid, killed=False)
+                                since_recycle = 0
+                                break
                             # A dead browser is worth one relaunch and one retry -
                             # the site itself was never really attempted. Anything
                             # else is this site's own failure.
                             if attempt == 1 and not browser.is_connected():
                                 log(f"{tag}    browser died ({type(exc).__name__}) - relaunching, "
                                     f"retrying this site", logfile)
-                                browser, context = await open_browser(pw, cfg, browser)
+                                browser, context, bpid = await open_browser(pw, cfg, None)
+                                beats[wid].update(pid=bpid, killed=False)
                                 since_recycle = 0
                                 continue
                             res = _row_result(row, "error", f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -684,6 +856,7 @@ async def main_async(args) -> int:
                     # without an await, so another worker cannot interleave
                     # part-way through and corrupt the state file or the counts.
                     heartbeat["at"] = time.time()
+                    beats[wid].update(at=time.time(), site="")
                     results.append(res)
                     state.record(row["website"], res)
                     since_recycle += 1
@@ -692,15 +865,16 @@ async def main_async(args) -> int:
                         f":: {res['detail'][:110]}", logfile)
                     # This sheet's own numbers - not the running total across every
                     # sheet ever uploaded, which is what the overall dashboard is for.
-                    build_report(dup_skips + results, report_mode, report_path)
+                    build_report(dup_skips + blocked + results, report_mode, report_path)
                     # Rebuilt here rather than only at the end: every run since the
                     # 27th was stopped or wedged before the final build, leaving the
                     # overall dashboard two days stale.
                     build_report(list(state.data.values()), report_mode,
                                  cfg.resolve(cfg.path("paths", "report_all_path",
                                                       default="output/report_all.html")))
-                    _dump_rows(cfg, dup_skips + results, report_mode,
-                               len(dup_skips) + len(rows), len(dup_skips) + done_count)
+                    _dump_rows(cfg, dup_skips + blocked + results, report_mode,
+                               len(dup_skips) + len(blocked) + carried_over + len(rows),
+                               len(dup_skips) + len(blocked) + carried_over + done_count)
 
                     # Burning through the rest of the sheet recording failures is
                     # worse than stopping: the rows look attempted when they never
@@ -716,43 +890,79 @@ async def main_async(args) -> int:
 
                     if not queue.empty():
                         await asyncio.sleep(jitter(cfg.path("run", "delay_between_sites"), (8, 20)))
+                        beats[wid]["at"] = time.time()
             finally:
+                hb = beats.get(wid)
+                if hb is not None:
+                    hb.update(at=time.time(), site="")
                 try:
-                    await context.close()
+                    await asyncio.wait_for(context.close(), timeout=15)
                 except Exception:
                     pass
                 try:
-                    await browser.close()
+                    await asyncio.wait_for(browser.close(), timeout=15)
                 except Exception:
                     pass
+                # only now is this worker genuinely finished; until this point
+                # the watchdog is still entitled to kill its browser
+                if hb is not None:
+                    hb["done"] = True
+                beats.pop(wid, None)
 
-        await asyncio.gather(*(run_worker(i + 1) for i in range(workers)),
-                             return_exceptions=True)
+        outcomes_per_worker = await asyncio.gather(
+            *(run_worker(i + 1) for i in range(workers)), return_exceptions=True)
+        for i, outcome in enumerate(outcomes_per_worker, 1):
+            if isinstance(outcome, BaseException):
+                # Silently losing a worker means running at a fraction of the
+                # configured rate for the rest of the batch with nothing in the
+                # log to say so.
+                log(f"w{i} ended on an unhandled {type(outcome).__name__}: "
+                    f"{str(outcome)[:160]}", logfile)
         # results arrive in completion order; the sheet's order is what readers expect
         results.sort(key=lambda r: r.get("row_index", 0))
         watch.cancel()
+        beat_watch.cancel()
 
     mailer.close()
-    out = write_results(dup_skips + results, cfg.resolve(cfg.path("paths", "results_path")))
-    log(f"done - {len(results)} rows -> {out}", logfile)
+    # The WHOLE sheet, not just this attempt's share of it. A run that was
+    # restarted part-way (watchdog, crash) only holds the rows it personally
+    # processed in `results` - writing those alone left results.xlsx showing
+    # six rows for a 467-row sheet, which reads as catastrophic failure.
+    sheet_name = Path(args.input).name
+    sheet_rows = [r for r in state.data.values() if r.get("sheet") == sheet_name]
+    seen = {norm_site(r.get("website", ""), scope) for r in sheet_rows}
+    sheet_rows += [r for r in dup_skips + blocked + results
+                   if norm_site(r.get("website", ""), scope) not in seen]
+    out = write_results(sheet_rows, cfg.resolve(cfg.path("paths", "results_path")))
+    log(f"done - {len(results)} rows this attempt, {len(sheet_rows)} in the sheet -> {out}",
+        logfile)
     log(f"screenshots -> {ev.dir}", logfile)
 
-    _dump_rows(cfg, dup_skips + results, report_mode,
-               len(dup_skips) + len(rows), len(dup_skips) + len(results))
-    report = build_report(dup_skips + results, report_mode, report_path)
+    _dump_rows(cfg, dup_skips + blocked + results, report_mode,
+               len(dup_skips) + len(blocked) + carried_over + len(rows),
+               len(dup_skips) + len(blocked) + carried_over + len(results))
+    report = build_report(dup_skips + blocked + results, report_mode, report_path)
     log(f"dashboard (this sheet) -> {report}", logfile)
     overall = build_report(list(state.data.values()), report_mode,
                            cfg.resolve(cfg.path("paths", "report_all_path",
                                                 default="output/report_all.html")))
     log(f"dashboard (all sheets) -> {overall}", logfile)
-    ledger = build_ledger(list(state.data.values()) + dup_skips,
+    ledger = build_ledger(list(state.data.values()) + dup_skips + blocked,
                           cfg.resolve(cfg.path("paths", "ledger_path", default="output/contacted.xlsx")))
     log(f"contacted ledger -> {ledger}", logfile)
+    # Kept per sheet rather than overwritten: report.html and results.xlsx are
+    # rebuilt every run, so without this the outcome of sheet N is gone the
+    # moment sheet N+1 starts.
+    sheet_name = Path(args.input).stem
+    outcomes = build_outcomes(list(state.data.values()) + dup_skips + blocked,
+                              report_path.parent / f"outcomes_{sheet_name}.xlsx",
+                              sheet_filter=Path(args.input).name)
+    log(f"outcome sheet (this sheet) -> {outcomes}", logfile)
 
     run_lock.__exit__()
 
     tally: dict[str, int] = {}
-    for r in dup_skips + results:
+    for r in dup_skips + blocked + results:
         tally[r["status"]] = tally.get(r["status"], 0) + 1
     log("summary: " + ", ".join(f"{k}={v}" for k, v in sorted(tally.items())), logfile)
     return 0

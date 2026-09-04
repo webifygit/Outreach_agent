@@ -438,7 +438,12 @@ def start():
         return start_run(input_path, live, headless, limit, script=script)
 
 
-MAX_RESTARTS = 25          # a ceiling, not an expectation
+# A ceiling, not an expectation - but it has to scale with the sheet. Batch1
+# needed 4 restarts for 467 rows (~1 per 120), so a 3000-row sheet needs ~26
+# and would have died just short of finishing under the old fixed 25. The
+# startup-failure guard in _supervise stops a hot loop, so a high ceiling is
+# safe: this exists to catch "restarting is not helping", not to cap a long run.
+MAX_RESTARTS = int(cfg.path("run", "max_restarts", default=200))
 
 
 def _spawn(argv, log_fh):
@@ -475,6 +480,43 @@ def _site_in_flight() -> str:
     return ""
 
 
+WORKER_LINE_RE = re.compile(
+    r"^\[[\d:]+\]\s+(w\d+)\s+(?:\[\d+/\d+\]\s+(\S+)|\s*->)")
+
+
+def _sites_in_flight() -> list[str]:
+    """Every site a worker announced but never reported a result for.
+
+    With one worker that is just the last site announced. With several, each
+    can be wedged on a different page, and every one of them has to be marked
+    or the resume walks straight back into them. A worker whose most recent
+    line is an announcement is still on that site; one whose most recent line
+    is a result has finished it.
+    """
+    try:
+        tail = RUN_LOG.read_text(encoding="utf-8", errors="replace")[-200_000:]
+    except OSError:
+        return []
+    latest: dict[str, str] = {}      # worker -> the site it is on, "" once done
+    for line in tail.splitlines():
+        m = WORKER_LINE_RE.match(line)
+        if m:
+            latest[m.group(1)] = m.group(2) or ""
+    urls = [u for u in latest.values() if u]
+    # a single-worker run carries no "wN" tag at all, so fall back to the
+    # last site the log announced
+    return urls or [u for u in (_site_in_flight(),) if u]
+
+
+def _last_input_name() -> str:
+    """Filename of the sheet currently being run, "" if that is not knowable."""
+    try:
+        path = STATE.get("input_path") or _last_input()
+        return Path(str(path)).name if path else ""
+    except Exception:
+        return ""
+
+
 def _record_stalled_site(url: str) -> None:
     """Mark a site that wedged the browser so a resume steps past it.
 
@@ -495,6 +537,10 @@ def _record_stalled_site(url: str) -> None:
             "method": "none", "status": "timeout",
             "detail": "the browser wedged here and the run had to be restarted - skipped",
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            # Carried from the row's own earlier record. Without it a wedged
+            # site drops out of every per-sheet report - the sheet it came from
+            # is the one field this hand-built entry cannot reconstruct.
+            "sheet": prior.get("sheet", _last_input_name()),
         }
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
@@ -539,6 +585,7 @@ def _supervise(argv, log_fh):
     the stall watch above). Either way it is restarted and continues.
     """
     restarts = 0
+    last_spawn = time.time()
     stall_after = float(cfg.path("run", "stall_timeout_s", default=600))
     # a restart should carry on, not redo the rows already attempted
     if "--continue-batch" not in argv:
@@ -556,9 +603,35 @@ def _supervise(argv, log_fh):
             if STATE.get("stopped_by_user"):
                 log_fh.write("--- stopped by user; not restarting ---\n")
                 break
-            if not stalled and not LOCK_FILE.exists():
+            # The exit code is the verdict here, not the lock file. run.py
+            # leaves the lock behind on a watchdog kill precisely so this loop
+            # can tell a crash from a finish - but /status calls
+            # _external_run_active() every few seconds and unlinks it as stale
+            # first, so the signal was usually gone before this loop next woke.
+            # Whether a wedged run resumed by itself came down to which of the
+            # two woke first, which is why it kept needing a restart by hand.
+            code = proc.returncode
+            if not stalled and code == 0:
                 log_fh.write("--- run finished cleanly ---\n")
                 break
+
+            # A run that dies within seconds having done nothing is broken in a
+            # way restarting cannot fix - a bad config, a missing input file.
+            # Restarting it 25 times just fills the log.
+            if not stalled and time.time() - last_spawn < 30:
+                log_fh.write(f"--- exited ({code}) after "
+                             f"{time.time() - last_spawn:.0f}s without starting "
+                             f"work; that is a startup failure, not a wedge - "
+                             f"not restarting ---\n")
+                break
+
+            # A watchdog kill (exit 3) leaves every worker's current site
+            # unrecorded, so a plain resume runs back into the same pages and
+            # wedges on them again. Mark all of them before respawning.
+            if stalled or code == 3:
+                for url in _sites_in_flight():
+                    _record_stalled_site(url)
+
             if restarts >= MAX_RESTARTS:
                 log_fh.write(f"--- died again; restart limit ({MAX_RESTARTS}) reached, giving up ---\n")
                 break
@@ -574,6 +647,7 @@ def _supervise(argv, log_fh):
             with _lock:
                 STATE["proc"] = _spawn(argv, log_fh)
                 STATE["restarts"] = restarts
+                last_spawn = time.time()
     finally:
         try:
             log_fh.flush()
@@ -798,6 +872,26 @@ def status():
     return jsonify(_status())
 
 
+@app.get("/outcomes.xlsx")
+def outcomes_xlsx():
+    """Every row and why it ended where it did, as a downloadable workbook.
+
+    ?sheet=<filename> limits it to one input sheet; omitted, it covers every
+    sheet ever run. Rebuilt on request from state.json, so it is never stale.
+    """
+    from agent.outcomes import build_outcomes
+    sheet = (request.args.get("sheet") or "").strip()
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return "no history yet", 404
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    label = re.sub(r"[^A-Za-z0-9_.-]", "_", sheet).rsplit(".", 1)[0] if sheet else "all_sheets"
+    out = REPORT_PATH.parent / f"outcomes_{label}_{stamp}.xlsx"
+    build_outcomes(list(data.values()), out, sheet_filter=sheet)
+    return send_from_directory(out.parent, out.name, as_attachment=True)
+
+
 @app.get("/files/<path:relpath>")
 def files(relpath):
     target = (ROOT / relpath).resolve()
@@ -876,7 +970,7 @@ def _contacted_rows():
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return [], []
+        return [], [], []
     reached = [r for r in data.values() if r.get("status") in ("sent", "success", "uncertain")]
     reached.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
     missed = [r for r in data.values()

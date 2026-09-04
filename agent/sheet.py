@@ -18,7 +18,12 @@ from urllib.parse import urlparse
 import pandas as pd
 
 ALIASES = {
-    "website": {"website", "url", "site", "web", "domain", "website link", "link", "weblink"},
+    # Plurals included: scraped exports (Google Maps, Apify and friends) label
+    # the column WEBSITES, and the loader used to reject the whole sheet with
+    # "No website column found" rather than take the obvious match.
+    "website": {"website", "websites", "url", "urls", "site", "sites", "web", "domain",
+                "domains", "website link", "website url", "link", "links", "weblink",
+                "web address", "homepage"},
     "company_name": {"company_name", "company", "company name", "name", "organisation",
                      "organization", "business", "client", "client name"},
     "email": {"email", "e-mail", "email id", "email address", "mail", "contact email"},

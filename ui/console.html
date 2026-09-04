@@ -705,6 +705,9 @@ tbody tr:hover { transform: translateX(2px); }
         <div class="inline-row" id="bounceRow">
           <button class="b-bounce" id="bounceBtn" style="width:100%">Check bounces</button>
         </div>
+        <div class="inline-row" id="exportRow">
+          <button class="b-bounce" id="exportBtn" style="width:100%">Download outcome sheet</button>
+        </div>
         <div class="inline-row" id="clearRow" hidden>
           <span class="count" id="clearCount">0</span>
           <button class="b-clear" id="clearBtn">Clear dry runs</button>
@@ -1023,8 +1026,14 @@ async function refresh() {
   // the new sheet's size is not known until the run reports it, so show
   // nothing rather than the previous sheet's figure
   const total = stale ? 0 : (meta.total || rows.length);
+  // meta.done counts the whole sheet, rows finished by an earlier attempt
+  // included. The feed only carries the CURRENT attempt's rows, so counting
+  // them here reported a resumed run as barely started - 52 of 469 when 288
+  // were actually done. Only fall back to the local count if meta has no
+  // figure (an older run.py, or a preview).
   const done  = (preview || stale) ? 0
-              : rows.filter(r => r.status && r.status !== 'running').length;
+              : (typeof meta.done === 'number' ? meta.done
+                 : rows.filter(r => r.status && r.status !== 'running').length);
   if (stale) rows = [];
   // the labels stay honest either way: nothing is completed until a run does it
   const fail  = rows.filter(r => BAD.has(r.status)).length;
@@ -1172,7 +1181,11 @@ async function post(url, body) {
 startBtn.addEventListener('click', async () => {
   if (!uploadedPath) return;
   const live = $('live').checked;
-  if (live && !confirm('Live mode is ON.\n\nContact forms will be submitted and emails sent for real, using the "' + scriptLabel(scriptKey) + '" pitch.\n\nContinue?')) return;
+  // The live-mode confirm was removed on request: starting a live sheet is the
+  // normal case here, not the exception, and the prompt was one more click on
+  // every single run. The dry-run default and the LIVE badge still make the
+  // mode obvious before you press Start.
+
   // a visible browser is fine for a handful of sites and miserable for a sheet
   if ($('showBrowser').checked) {
     const rows = parseInt($('limit').value || '0', 10);
@@ -1222,6 +1235,21 @@ $('bounceBtn').addEventListener('click', async () => {
   }
   toast('Checking mailboxes', 'This takes a minute or two', 'ok');
   startPolling();
+});
+
+/* Outcome workbook: every row and why it ended where it did - approached,
+   blocked by CAPTCHA, no form found, unreachable. Built server-side from the
+   full history on each click, so it is never stale. */
+$('exportBtn').addEventListener('click', () => {
+  const btn = $('exportBtn');
+  btn.disabled = true;
+  btn.innerHTML = 'Building <span class="dots"><i></i><i></i><i></i></span>';
+  location.href = '/outcomes.xlsx';
+  setTimeout(() => {
+    btn.disabled = false;
+    btn.textContent = 'Download outcome sheet';
+    toast('Outcome sheet ready', 'Check your downloads', 'ok');
+  }, 2500);
 });
 
 $('resumeBtn').addEventListener('click', async () => {

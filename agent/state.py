@@ -34,10 +34,13 @@ def norm_site(url: str, scope: str = "host") -> str:
 
 
 class State:
-    def __init__(self, path: str | Path, dedupe_scope: str = "host"):
+    def __init__(self, path: str | Path, dedupe_scope: str = "host", sheet: str = ""):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.scope = dedupe_scope
+        # Which sheet a row came from. Without it every batch collapses into one
+        # undifferentiated pool and "how did batch 37 do?" has no answer.
+        self.sheet = sheet
         self.data: dict[str, dict] = {}
         if self.path.exists():
             try:
@@ -89,6 +92,8 @@ class State:
         return self.data.get(url)
 
     def record(self, url: str, result: dict) -> None:
+        if self.sheet:
+            result.setdefault("sheet", self.sheet)
         self.data[url] = result
         self._index(url, result)
         self.flush()
