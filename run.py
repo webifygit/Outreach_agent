@@ -331,15 +331,38 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
         if report["missing_required"]:
             result["detail"] += f"unmapped required fields: {report['missing_required']}. "
 
+        # Ask the browser what it would reject before clicking. A submit
+        # blocked by validation leaves the page exactly as it was, which is
+        # indistinguishable from a quiet success - so catch it here instead
+        # of guessing afterwards.
+        rejected = await filler.invalid_fields(frame, form["form_key"])
+        if rejected:
+            result["detail"] += f"form incomplete: {rejected}. "
+
         if not cfg.live:
             result["status"] = "dry_run"
             result["detail"] += f"filled {report['roles']} - not submitted (dry run)"
             return True
 
+        if rejected:
+            # Clicking would be a no-op. Hand the row to the email fallback.
+            result["status"] = "failed"
+            result["detail"] += "not submitted - the browser would reject it"
+            return False
+
         before_url = page.url
+        before_body = await filler.read_context_body(page, frame)
         click = await filler.submit_form(frame, form["form_key"], timeout)
-        status, detail = await filler.verify_submission(page, frame, before_url, form["form_key"])
+        status, detail, strength = await filler.verify_submission(
+            page, frame, before_url, form["form_key"], before_body
+        )
         result["screenshot_after"] = await ev.shot(page, idx, url, "02_after_submit")
+        # A required field we never mapped may be exactly what the site needed.
+        # A redirect or fresh confirmation text still proves it landed; a form
+        # that merely vanished from the DOM does not.
+        if status == "success" and strength != "strong" and report["missing_required"]:
+            status = "uncertain"
+            detail += " - but required fields were left unmapped"
         result["status"] = status
         result["detail"] += f"{click}; {detail}"
         return status != "failed"

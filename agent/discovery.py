@@ -160,14 +160,23 @@ EXTRACT_FORMS_JS = r"""
       const id = 'f' + fi + '-e' + (ei++);
       el.setAttribute('data-agent-id', id);
       const rawMax = el.maxLength;
+      const req = el.hasAttribute('required') || el.getAttribute('aria-required') === 'true';
+      const vis = visible(el) && type !== 'hidden';
       fields.push({
         agent_id: id,
         tag: tag,
         type: type,
         name: el.getAttribute('name') || '',
         checked: !!el.checked,
-        required: el.hasAttribute('required') || el.getAttribute('aria-required') === 'true',
-        visible: visible(el) && type !== 'hidden',
+        required: req,
+        visible: vis,
+        // A honeypot is never marked required - no site forces a bot to fill
+        // its trap. So a required control counts as fillable even when it
+        // fails the size test: Select2, Chosen and friends shrink the real
+        // <select> to 1x1 and draw their own widget over it, and skipping it
+        // leaves a required field empty that the browser then refuses to
+        // submit - silently, with the form still on screen.
+        fillable: vis || req,
         maxlength: (typeof rawMax === 'number' && rawMax > 0 && rawMax < 100000) ? rawMax : null,
         desc: describe(el),
         options: tag === 'select'
