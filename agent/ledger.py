@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .state import CONTACTED_STATUSES
+from .state import CONTACTED_STATUSES, split_touches
 
 FORM_COLS = ["website", "company_name", "contact_page", "status", "sender",
              "sender_email", "detail", "screenshot_after", "timestamp"]
@@ -18,6 +18,8 @@ MAIL_COLS = ["website", "company_name", "email_used", "status", "sender",
              "sender_email", "detail", "screenshot_after", "timestamp"]
 SKIP_COLS = ["website", "company_name", "method", "email_used", "contact_page",
              "first_contacted", "detail", "timestamp"]
+FOLLOWUP_COLS = ["website", "company_name", "first_contacted", "timestamp",
+                 "script", "method", "status", "detail", "screenshot_after"]
 
 
 def _frame(rows: list[dict], cols: list[str]) -> pd.DataFrame:
@@ -39,9 +41,10 @@ def build_ledger(records: list[dict], path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    reached = [r for r in records if r.get("status") in CONTACTED_STATUSES]
-    forms = [r for r in reached if r.get("method") == "form"]
-    mails = [r for r in reached if r.get("method") == "email"]
+    firsts, followups = split_touches(records)
+
+    forms = [r for r in firsts if r.get("method") == "form"]
+    mails = [r for r in firsts if r.get("method") == "email"]
     skipped = [r for r in records if r.get("status") == "skipped_duplicate"]
 
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
@@ -51,4 +54,6 @@ def build_ledger(records: list[dict], path: str | Path) -> Path:
             xl, sheet_name=_sheet_name("Emails sent", len(mails)), index=False)
         _frame(skipped, SKIP_COLS).to_excel(
             xl, sheet_name=_sheet_name("Already approached", len(skipped)), index=False)
+        _frame(followups, FOLLOWUP_COLS).to_excel(
+            xl, sheet_name=_sheet_name("Follow-ups", len(followups)), index=False)
     return path

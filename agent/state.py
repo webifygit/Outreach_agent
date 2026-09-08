@@ -38,6 +38,43 @@ def norm_site(url: str, scope: str = "host") -> str:
     return host
 
 
+def split_touches(records) -> tuple[list[dict], list[dict]]:
+    """(first contacts, follow-ups) from raw state records.
+
+    One row per business in the first list, taken from its FIRST approach: a
+    follow-up overwrites the top-level fields of the record it lands on, so
+    reading those shows the second message in place of the first and counts the
+    business again under a second heading.
+
+    Approaches imported from a sheet of contacts made by hand are left out of
+    both. They are kept in state so the agent never writes to those businesses
+    cold, but they are not its own work and inflate any count of it.
+
+    The two lists deliberately overlap by business: a followed-up business
+    appears in each, once as a first contact and once per follow-up. Adding the
+    totals is therefore wrong, which is why they are reported side by side.
+    """
+    firsts: list[dict] = []
+    followups: list[dict] = []
+    for rec in records:
+        touches = rec.get("touches") or [rec]
+        first = touches[0]
+        if (first.get("status") in CONTACTED_STATUSES
+                and not first.get("follow_up") and not first.get("manual")):
+            row = dict(first)
+            row.setdefault("website", rec.get("website"))
+            row.setdefault("company_name", rec.get("company_name"))
+            firsts.append(row)
+        for touch in touches:
+            if touch.get("follow_up") and touch.get("status") in CONTACTED_STATUSES:
+                row = dict(touch)
+                row.setdefault("website", rec.get("website"))
+                row.setdefault("company_name", rec.get("company_name"))
+                row["first_contacted"] = rec.get("first_contacted", "")
+                followups.append(row)
+    return firsts, followups
+
+
 class State:
     def __init__(self, path: str | Path, dedupe_scope: str = "host", sheet: str = ""):
         self.path = Path(path)

@@ -32,6 +32,8 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory, session
 from werkzeug.utils import secure_filename
 
+from agent.state import split_touches
+
 from agent import scripts as pitch_scripts
 from agent.config import Config, default_config_path, load_env_file
 
@@ -971,24 +973,7 @@ def _contacted_rows():
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return [], [], []
-    # One business, one entry. What counts here is the FIRST approach, not the
-    # newest record: a follow-up overwrites the top-level fields, so reading
-    # those would drop a business out of the total on the day it was followed
-    # up, and count it again under a second heading. Follow-ups are totalled
-    # separately by _followup_rows().
-    CONTACTED = ("sent", "success", "uncertain")
-    reached = []
-    for rec in data.values():
-        first = (rec.get("touches") or [rec])[0]
-        # Touches imported from a spreadsheet of approaches people made by
-        # hand are kept so the agent never writes to those businesses cold,
-        # but they are not the agent's own work and do not belong in its count.
-        if (first.get("status") in CONTACTED and not first.get("follow_up")
-                and not first.get("manual")):
-            row = dict(first)
-            row.setdefault("website", rec.get("website"))
-            row.setdefault("company_name", rec.get("company_name"))
-            reached.append(row)
+    reached, _ = split_touches(data.values())
     reached.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
     missed = [r for r in data.values()
               if r.get("status") in ("no_contact_found", "unreachable",
@@ -1009,16 +994,7 @@ def _followup_rows():
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
-    CONTACTED = ("sent", "success", "uncertain")
-    out = []
-    for rec in data.values():
-        for touch in (rec.get("touches") or [rec]):
-            if touch.get("follow_up") and touch.get("status") in CONTACTED:
-                row = dict(touch)
-                row.setdefault("website", rec.get("website"))
-                row.setdefault("company_name", rec.get("company_name"))
-                row["first_contacted"] = rec.get("first_contacted", "")
-                out.append(row)
+    _, out = split_touches(data.values())
     out.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
     return out
 
@@ -1251,7 +1227,10 @@ def coverage_page():
     return COVERAGE_HTML.replace("{css}", CONTACTED_CSS)
 
 
-COVERAGE_HTML = """<!doctype html>
+# Raw: the page carries JS regex literals like /^https?:\/\// whose backslashes
+# are the regex's own. Without r"" Python reads them as escape sequences, warns
+# on every import, and will make it an error in a future version.
+COVERAGE_HTML = r"""<!doctype html>
 <meta charset="utf-8"><title>Coverage check - outreach agent</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{css}
