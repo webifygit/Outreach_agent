@@ -541,6 +541,9 @@ async def main_async(args) -> int:
         log(f"REFUSING to run: {exc}", logfile)
         return 2
     log(f"script: {script_label} ({script_key})", logfile)
+    if cfg.get("_follow_up"):
+        log("follow-up script: contacting sites we have already written to - "
+            "the duplicate and resume guards are open for this run only", logfile)
 
     placeholders = identity_placeholders(cfg)
     if placeholders:
@@ -612,7 +615,7 @@ async def main_async(args) -> int:
     # is keyed by URL, so recording a skip would overwrite the very record of
     # the original contact we are trying to preserve.
     dup_skips: list[dict] = []
-    if cfg.path("run", "skip_already_contacted", default=True):
+    if cfg.path("run", "skip_already_contacted", default=True) and not cfg.get("_follow_up"):
         fresh = []
         for r in rows:
             prior = state.contacted_site(r["website"])
@@ -676,19 +679,34 @@ async def main_async(args) -> int:
     # the progress counter restarts from zero against a shrinking total on every
     # resume - which reads as work being lost when nothing has been.
     carried_over = 0
+    run_started = datetime.now()
 
     if getattr(args, "continue_batch", False):
         # Picking up a batch that stopped: anything with a record was already
         # visited, whatever the outcome, so start from the first row that has
         # none. Matched on the normalised host so a www/https difference in the
         # sheet does not look like a new site.
-        seen_hosts = {norm_site(u, scope) for u in state.data}
+        #
+        # A follow-up is the exception. Every one of its rows has a record by
+        # definition - that record is why it earned a second message - so the
+        # plain test skips the whole sheet and sends nothing. What counts as
+        # "already attempted" here is a touch from this run, i.e. one written
+        # since the process started.
+        if cfg.get("_follow_up"):
+            cutoff = run_started.isoformat(timespec="seconds")
+            seen_hosts = {norm_site(u, scope) for u, e in state.data.items()
+                          if str(e.get("timestamp", "")) >= cutoff}
+            log(f"continuing a follow-up batch: counting only touches since {cutoff}",
+                logfile)
+        else:
+            seen_hosts = {norm_site(u, scope) for u in state.data}
         pending = [r for r in rows if norm_site(r["website"], scope) not in seen_hosts]
         log(f"continuing batch: {len(rows) - len(pending)} row(s) already attempted, "
             f"{len(pending)} to go", logfile)
         carried_over = len(rows) - len(pending)
         rows = pending
-    elif cfg.path("run", "resume", default=True) and not args.no_resume:
+    elif (cfg.path("run", "resume", default=True) and not args.no_resume
+          and not cfg.get("_follow_up")):
         pending = [r for r in rows if not state.is_done(r["website"])]
         if len(pending) < len(rows):
             log(f"resume: skipping {len(rows) - len(pending)} already-processed rows", logfile)

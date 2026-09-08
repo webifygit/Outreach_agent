@@ -47,6 +47,7 @@ def configured(cfg) -> list[dict]:
             "blurb": str(item.get("blurb") or ""),
             "email": item.get("email") or {},
             "form": item.get("form") or {},
+            "follow_up": bool(item.get("follow_up")),
         })
     return out
 
@@ -100,6 +101,13 @@ def apply(cfg, key: str | None) -> tuple[str, str]:
             f"unknown script {wanted!r} - configured: "
             + ", ".join(s["key"] for s in found)
         )
+
+    # A follow-up script talks to businesses we have already written to, so the
+    # two guards that exist to stop a second message are exactly wrong for it.
+    # Recorded here rather than left to the operator: forgetting either one
+    # sends nothing at all, silently, and forgetting to put them back exposes
+    # the whole ledger to being contacted twice.
+    cfg["_follow_up"] = bool(chosen.get("follow_up"))
 
     for block, allowed in WORDING_KEYS.items():
         section = cfg.get(block)
