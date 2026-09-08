@@ -317,8 +317,22 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     if use_form and cfg.path("form", "require_message", default=True):
         if "message" not in filler.classify(top_form["fields"]):
             use_form = False
-            spare_form_url = contact_url or page.url
             result["detail"] += "form has no message field (pitch could not be included) - preferring email. "
+            # Whether to keep it as a last resort depends on whether we have
+            # written to this business before. A messageless form delivers a
+            # name and an address and nothing else: on a FIRST touch that is
+            # still better than silence. On a FOLLOW-UP it is not - the entire
+            # message is "I reached out a little while ago", so an empty second
+            # enquiry says nothing and reads as a glitch. It also scores as a
+            # success once the page confirms, which is how chantalmorgan.co.za
+            # came back a win on 2026-09-08 having been sent nothing at all.
+            prior_touch = state.contacted_site(url) if state is not None else None
+            if prior_touch and not cfg.path("form", "messageless_on_followup", default=False):
+                result["detail"] += (
+                    f"already approached {str(prior_touch.get('timestamp', ''))[:10]} - "
+                    "not sending a second enquiry that carries no message. ")
+            else:
+                spare_form_url = contact_url or page.url
 
     async def attempt_form(form, frame) -> bool:
         """Fill and submit one form. True if this row is finished with."""

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from agent.sheet import load_rows          # noqa: E402
 from agent.state import norm_site          # noqa: E402
+from agent.config import Config            # noqa: E402
 
 # Hosts that are somebody's page, not somebody's website. The agent has no
 # filter for these: the first one claims the host and every later row on the
@@ -102,8 +103,16 @@ def main(path: str) -> int:
         if len(skipped) > 10:
             print(f"    and {len(skipped) - 10} more")
 
-    est = len(usable) / 174
-    print(f"\nestimated run time  {est:.1f} h at ~174 sites/hr (workers=6, typical batch)")
+    # Rate scales with workers, and the printed figure used to be pinned to 6 -
+    # a count that wedged an 8GB machine into swap and was settled at 4.
+    try:
+        cfg = Config.load(Path(__file__).parent / "config.local.yaml")
+    except Exception:
+        cfg = Config()
+    workers = int(cfg.path("run", "workers", default=4) or 4)
+    rate = 29 * workers
+    est = len(usable) / rate
+    print(f"\nestimated run time  {est:.1f} h at ~{rate} sites/hr (workers={workers}, typical batch)")
     if not usable:
         print("\nNOTHING TO SEND - do not upload this sheet.")
         return 1

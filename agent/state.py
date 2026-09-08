@@ -10,6 +10,11 @@ from urllib.parse import urlparse
 # just could not read a confirmation - resubmitting would be a second message.
 CONTACTED_STATUSES = {"sent", "success", "uncertain"}
 
+# What is kept per approach in an entry's "touches" list. Deliberately not the
+# whole record: row_index and company_name belong to the sheet, not the touch.
+TOUCH_FIELDS = ("timestamp", "sheet", "method", "status", "detail",
+                "contact_page", "email_used", "sender", "screenshot_after")
+
 
 def norm_site(url: str, scope: str = "host") -> str:
     """Canonical key for a site, so trivial URL differences are not new sites.
@@ -57,7 +62,12 @@ class State:
             self._index(url, entry)
 
     def _index(self, url: str, entry: dict) -> None:
-        if entry.get("status") not in CONTACTED_STATUSES:
+        # An earlier touch that did reach the business still counts, even when
+        # the newest attempt did not. Without this a follow-up that came back
+        # "skipped_no_email" would hide the successful first approach and the
+        # site would read as never contacted - which is how it looks to both
+        # the duplicate guard and the message-less form guard.
+        if not self._ever_contacted(entry):
             return
         key = norm_site(url, self.scope)
         if key:
@@ -65,6 +75,13 @@ class State:
         addr = str(entry.get("email_used") or "").strip().lower()
         if addr:
             self._emails[addr] = entry
+
+    @staticmethod
+    def _ever_contacted(entry: dict) -> bool:
+        if entry.get("status") in CONTACTED_STATUSES:
+            return True
+        return any(t.get("status") in CONTACTED_STATUSES
+                   for t in (entry.get("touches") or []))
 
     def contacted_site(self, url: str) -> dict | None:
         """The earlier record for this site, if we already reached it."""
@@ -94,9 +111,34 @@ class State:
     def record(self, url: str, result: dict) -> None:
         if self.sheet:
             result.setdefault("sheet", self.sheet)
+        prior = self.data.get(url)
+        if prior:
+            # A second touch must not erase the first. This dict is keyed by
+            # URL and used to be overwritten outright, so a follow-up run threw
+            # away the date, the evidence and the form that the original
+            # approach used - the very record proving we had earned the right
+            # to follow up. Keep every attempt in "touches", oldest first, and
+            # let the top-level fields stay the latest so nothing else has to
+            # change.
+            history = list(prior.get("touches") or [])
+            if not history:
+                history = [{k: prior.get(k, "") for k in TOUCH_FIELDS}]
+            history.append({k: result.get(k, "") for k in TOUCH_FIELDS})
+            result["touches"] = history
+            result["touch_count"] = len(history)
+            first = history[0].get("timestamp", "")
+            if first:
+                result["first_contacted"] = first
         self.data[url] = result
         self._index(url, result)
         self.flush()
+
+    def touches(self, url: str) -> list[dict]:
+        """Every recorded approach to this site, oldest first."""
+        entry = self._sites.get(norm_site(url, self.scope))
+        if not entry:
+            return []
+        return list(entry.get("touches") or [{k: entry.get(k, "") for k in TOUCH_FIELDS}])
 
     def flush(self) -> None:
         tmp = self.path.with_suffix(".tmp")
