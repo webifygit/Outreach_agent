@@ -21,6 +21,8 @@ DEFAULT_MESSAGE_TIERS = {
 
 # Ordered: the first pattern that matches a field wins, so put specific before generic.
 ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("email_confirm", re.compile(r"(confirm|verify|repeat|re-?enter|again).{0,12}e-?mail|"
+                                r"e-?mail.{0,12}(confirm|verify|again|2)")),
     ("email",     re.compile(r"\be-?mail\b|email|correo|courriel")),
     ("phone",     re.compile(r"phone|mobile|tel(ephone)?\b|contact ?(no|number)|whatsapp")),
     ("company",   re.compile(r"company|organi[sz]ation|business|firm|employer|brand")),
@@ -40,7 +42,8 @@ ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("state",     re.compile(r"\bstate\b|province|\bregion\b|county")),
     # "email address" must stay an email field, so the bare word is only an
     # address when it is not the tail of one of those.
-    ("address",   re.compile(r"(?<!e-mail )(?<!email )\baddress\b|street|\baddr\b")),
+    ("address",   re.compile(r"(?<!e-mail )(?<!email )\baddress\b|street|\baddr\b|"
+                             r"addr[_-]?(line)?[_-]?\d|address[_-]?(line)?[_-]?\d")),
     ("country",   re.compile(r"country|nation")),
     ("budget",    re.compile(r"budget|price range|investment")),
 ]
@@ -123,9 +126,15 @@ def classify(fields: list[dict]) -> dict[str, dict]:
         if f["type"] in {"checkbox", "radio"}:
             continue
         desc = f["desc"]
-        if f["type"] == "email" and "email" not in roles:
-            roles["email"] = f
-            continue
+        # The type shortcut must not let a "Confirm email" box take the primary
+        # email role - both are type=email, and whichever comes first in the DOM
+        # would win, leaving the real one blank.
+        if f["type"] == "email":
+            confirm = dict(ROLE_PATTERNS)["email_confirm"].search(desc)
+            key = "email_confirm" if confirm else "email"
+            if key not in roles:
+                roles[key] = f
+                continue
         if f["type"] == "tel" and "phone" not in roles:
             roles["phone"] = f
             continue
@@ -190,6 +199,7 @@ def values_for(cfg, ctx: dict, message: str, subject: str) -> dict[str, str]:
         "first_name": s.get("first_name", "") or s.get("name", "").split(" ")[0],
         "last_name": s.get("last_name", "") or " ".join(s.get("name", "").split(" ")[1:]),
         "email": s.get("email", ""),
+        "email_confirm": s.get("email", ""),
         # No spaces. Plenty of forms validate a phone field with a pattern that
         # allows digits and the usual punctuation (+ # - * ) but NOT a space,
         # and reject the whole submission with "the field accepts only numbers
@@ -389,12 +399,64 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
             except Exception:
                 continue
 
+    # Last resort for a required field we could not name. Every site invents its
+    # own ("leadtypeid", "dropdown_1", "new_customer_select", "model"), and one
+    # of them left unfilled fails the browser's own validity check, which blocks
+    # the submit and loses the whole approach - 488 rows in the 74k run alone.
+    # A plausible value beats silence: the enquiry still reaches a human, who can
+    # read the message. Never touches checkboxes, radios or selects - those have
+    # their own passes above - and never invents a number where a real one
+    # matters more than submitting, so budget-like fields are left alone.
     for field in form["fields"]:
-        if field["required"] and fillable(field) and field["type"] not in {"checkbox", "radio"}:
-            if not any(f is field for f in roles.values()):
-                missing_required.append(field["desc"][:60] or field["type"])
+        if not (field["required"] and fillable(field)):
+            continue
+        if field["type"] in {"checkbox", "radio"} or field["tag"] == "select":
+            continue
+        if any(f is field for f in roles.values()):
+            continue
+        desc = field["desc"]
+        guess = _last_resort_value(field, values, desc)
+        if not guess:
+            missing_required.append(desc[:60] or field["type"])
+            continue
+        sel = f"[data-agent-id='{field['agent_id']}']"
+        try:
+            if await _set_value(frame, sel, guess, is_select=False):
+                filled[f"required?:{desc[:24]}"] = guess[:40]
+            else:
+                missing_required.append(desc[:60] or field["type"])
+        except Exception:  # noqa: BLE001
+            missing_required.append(desc[:60] or field["type"])
 
     return {"filled": filled, "roles": list(roles), "missing_required": missing_required}
+
+
+# Budget/quantity boxes where a made-up number is worse than an unsent form, and
+# anything that reads like a date the site will parse itself.
+_NO_GUESS = re.compile(r"budget|price|amount|quantity|how many|number of|salary|"
+                       r"captcha|security code|verification code|answer", re.I)
+
+
+def _last_resort_value(field: dict, values: dict, desc: str) -> str:
+    """A plausible value for a required field we could not classify."""
+    if _NO_GUESS.search(desc):
+        return ""
+    typ = field.get("type") or ""
+    if typ == "email":
+        return values.get("email", "")
+    if typ == "tel":
+        return values.get("phone", "")
+    if typ == "url":
+        return values.get("website", "")
+    if typ == "number":
+        return "1"
+    if typ == "date":
+        return __import__("datetime").date.today().isoformat()
+    if field.get("tag") == "textarea":
+        return values.get("message", "") or values.get("company", "")
+    # A plain text box: the company name is always true, never nonsense, and
+    # reads sensibly whatever the field turns out to have been asking for.
+    return values.get("company", "")
 
 
 async def _select_best(frame, sel, field, role, value):
