@@ -12,8 +12,8 @@ CONTACTED_STATUSES = {"sent", "success", "uncertain"}
 
 # What is kept per approach in an entry's "touches" list. Deliberately not the
 # whole record: row_index and company_name belong to the sheet, not the touch.
-TOUCH_FIELDS = ("timestamp", "sheet", "method", "status", "detail",
-                "contact_page", "email_used", "sender", "screenshot_after")
+TOUCH_FIELDS = ("timestamp", "sheet", "script", "follow_up", "method", "status",
+                "detail", "contact_page", "email_used", "sender", "screenshot_after")
 
 
 def norm_site(url: str, scope: str = "host") -> str:

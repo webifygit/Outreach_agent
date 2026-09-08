@@ -912,6 +912,12 @@ async def main_async(args) -> int:
                     # part-way through and corrupt the state file or the counts.
                     heartbeat["at"] = time.time()
                     beats[wid].update(at=time.time(), site="")
+                    # Stamp which campaign this touch belongs to. Without it a
+                    # follow-up is indistinguishable from a first approach once
+                    # written, and the dashboard counts one business twice as
+                    # if two had been reached.
+                    res["script"] = script_key
+                    res["follow_up"] = bool(cfg.get("_follow_up"))
                     results.append(res)
                     state.record(row["website"], res)
                     since_recycle += 1

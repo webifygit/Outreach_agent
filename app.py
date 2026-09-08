@@ -971,7 +971,24 @@ def _contacted_rows():
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return [], [], []
-    reached = [r for r in data.values() if r.get("status") in ("sent", "success", "uncertain")]
+    # One business, one entry. What counts here is the FIRST approach, not the
+    # newest record: a follow-up overwrites the top-level fields, so reading
+    # those would drop a business out of the total on the day it was followed
+    # up, and count it again under a second heading. Follow-ups are totalled
+    # separately by _followup_rows().
+    CONTACTED = ("sent", "success", "uncertain")
+    reached = []
+    for rec in data.values():
+        first = (rec.get("touches") or [rec])[0]
+        # Touches imported from a spreadsheet of approaches people made by
+        # hand are kept so the agent never writes to those businesses cold,
+        # but they are not the agent's own work and do not belong in its count.
+        if (first.get("status") in CONTACTED and not first.get("follow_up")
+                and not first.get("manual")):
+            row = dict(first)
+            row.setdefault("website", rec.get("website"))
+            row.setdefault("company_name", rec.get("company_name"))
+            reached.append(row)
     reached.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
     missed = [r for r in data.values()
               if r.get("status") in ("no_contact_found", "unreachable",
@@ -980,6 +997,30 @@ def _contacted_rows():
     return ([r for r in reached if r.get("method") == "email"],
             [r for r in reached if r.get("method") == "form"],
             missed)
+
+
+def _followup_rows():
+    """Second and later approaches, newest first, with their first touch.
+
+    Counted apart from _contacted_rows(): the same business appears in both, so
+    adding them would double-count the reach of the campaign.
+    """
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    CONTACTED = ("sent", "success", "uncertain")
+    out = []
+    for rec in data.values():
+        for touch in (rec.get("touches") or [rec]):
+            if touch.get("follow_up") and touch.get("status") in CONTACTED:
+                row = dict(touch)
+                row.setdefault("website", rec.get("website"))
+                row.setdefault("company_name", rec.get("company_name"))
+                row["first_contacted"] = rec.get("first_contacted", "")
+                out.append(row)
+    out.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
+    return out
 
 
 def _esc(value) -> str:
@@ -1467,9 +1508,27 @@ def contacted():
         missed_rows = ('<tr><td colspan="4"><div class="empty">'
                        'Every site with a contact route was reached.</div></td></tr>')
 
+    followups = _followup_rows()
+    if followups:
+        followup_rows = "".join(
+            '<tr><td><strong>{}</strong><br><a href="{}" target="_blank" rel="noopener">{}</a></td>'
+            '<td class="mono">{}</td><td class="mono">{}</td>'
+            '<td><span class="pill {}">{}</span></td><td>{}</td></tr>'.format(
+                _esc(r.get("company_name")), _esc(r.get("website")), _esc(r.get("website")),
+                _esc(str(r.get("first_contacted") or "")[:10]),
+                _esc(str(r.get("timestamp") or "")[:10]),
+                "ok" if r.get("status") == "success" else "warn",
+                _esc(r.get("status")), _esc(str(r.get("detail") or "")[:110]))
+            for r in followups)
+    else:
+        followup_rows = ('<tr><td colspan="5"><div class="empty">'
+                         'No follow-ups sent yet.</div></td></tr>')
+
     page = CONTACTED_HTML
     for token, value in (("{css}", CONTACTED_CSS), ("{n_mail}", str(len(mails))),
                          ("{n_form}", str(len(forms))), ("{n_missed}", str(len(missed))),
+                         ("{n_followup}", str(len(followups))),
+                         ("{followup_rows}", followup_rows),
                          ("{mail_rows}", mail_rows), ("{form_rows}", form_rows),
                          ("{missed_rows}", missed_rows)):
         page = page.replace(token, value)
@@ -1496,7 +1555,9 @@ CONTACTED_HTML = """<!doctype html>
   <div class="bar">
     <div>
       <h1>Already contacted</h1>
-      <p class="sub">Everyone the agent has reached. These are skipped automatically on future runs.</p>
+      <p class="sub">Everyone the agent has reached, counted once each - a follow-up is a
+        second message to a business already listed here, so it is totalled separately
+        rather than added in. All of these are skipped automatically on future runs.</p>
     </div>
     <a class="btn" href="/">&larr; Back to runs</a>
   </div>
@@ -1506,6 +1567,8 @@ CONTACTED_HTML = """<!doctype html>
       Email addresses <span class="count">({n_mail})</span></button>
     <button class="tab" role="tab" id="t-form" aria-selected="false" onclick="pick('form')">
       Contact forms <span class="count">({n_form})</span></button>
+    <button class="tab" role="tab" id="t-followup" aria-selected="false" onclick="pick('followup')">
+      Follow-ups <span class="count">({n_followup})</span></button>
     <button class="tab" role="tab" id="t-missed" aria-selected="false" onclick="pick('missed')">
       Not reached <span class="count">({n_missed})</span></button>
   </div>
@@ -1518,6 +1581,10 @@ CONTACTED_HTML = """<!doctype html>
     <table><thead><tr><th>Company / site</th><th>Form page</th><th>Filled as</th>
       <th>Status</th><th>Evidence</th><th>When</th></tr></thead><tbody>{form_rows}</tbody></table>
   </div>
+  <div class="panel" id="p-followup" hidden>
+    <table><thead><tr><th>Company / site</th><th>First contacted</th><th>Followed up</th>
+      <th>Status</th><th>Detail</th></tr></thead><tbody>{followup_rows}</tbody></table>
+  </div>
   <div class="panel" id="p-missed" hidden>
     <table><thead><tr><th>Company / site</th><th>Status</th><th>Why not reached</th>
       <th>Last tried</th></tr></thead><tbody>{missed_rows}</tbody></table>
@@ -1525,7 +1592,7 @@ CONTACTED_HTML = """<!doctype html>
 </div>
 <script>
   function pick(which) {
-    for (const key of ['mail', 'form']) {
+    for (const key of ['mail', 'form', 'followup', 'missed']) {
       const on = key === which;
       document.getElementById('p-' + key).hidden = !on;
       document.getElementById('t-' + key).setAttribute('aria-selected', on);
