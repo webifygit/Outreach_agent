@@ -27,12 +27,17 @@ ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("website",   re.compile(r"website|web ?site|\burl\b|domain|company site")),
     ("first_name", re.compile(r"first[ _-]?name|fname|given[ _-]?name|\bfirst\b")),
     ("last_name", re.compile(r"last[ _-]?name|lname|surname|family[ _-]?name|\blast\b")),
+    # Before "subject" on purpose: that pattern matches "title", so a Job Title
+    # box used to be handed the subject line instead of the sender's role.
+    ("designation", re.compile(r"designation|job ?title|your ?title|position|"
+                               r"role|occupation|job ?role")),
     ("subject",   re.compile(r"subject|regarding|topic|reason|enquiry ?type|inquiry ?type|title")),
     ("message",   re.compile(r"message|comment|enquir|inquir|detail|describe|question|"
                              r"requirement|project|how can we help|tell us|body|content|brief")),
     ("name",      re.compile(r"\bname\b|full[ _-]?name|your name|contact person")),
     ("postcode",  re.compile(r"zip|postal|post ?code|postcode|pin ?code|eircode")),
     ("city",      re.compile(r"\bcity\b|town|location")),
+    ("state",     re.compile(r"\bstate\b|province|\bregion\b|county")),
     # "email address" must stay an email field, so the bare word is only an
     # address when it is not the tail of one of those.
     ("address",   re.compile(r"(?<!e-mail )(?<!email )\baddress\b|street|\baddr\b")),
@@ -98,7 +103,21 @@ def classify(fields: list[dict]) -> dict[str, dict]:
     roles: dict[str, dict] = {}
     textareas = [f for f in fields if f["tag"] == "textarea" and f["visible"]]
 
+    # Claim the message box FIRST, before any pattern matching. A contact form's
+    # message is a textarea essentially every time, and "desc" includes the
+    # element's class list - so a plain <input> whose classes happen to contain
+    # "content", "detail", "brief" or the like used to match the (deliberately
+    # broad) message pattern and take the role, because message is tested before
+    # name. The textarea fallback below then never fired, because the role was
+    # already taken. The result was the whole pitch typed into the Name box and
+    # the real message box left empty, failing the form's own required check -
+    # seen on integrand.co.za, 2026-09-08.
+    if textareas:
+        roles["message"] = textareas[0]
+
     for f in fields:
+        if f in roles.values():
+            continue
         if not fillable(f) or f["type"] in {"hidden", "file", "password"}:
             continue
         if f["type"] in {"checkbox", "radio"}:
@@ -171,10 +190,18 @@ def values_for(cfg, ctx: dict, message: str, subject: str) -> dict[str, str]:
         "first_name": s.get("first_name", "") or s.get("name", "").split(" ")[0],
         "last_name": s.get("last_name", "") or " ".join(s.get("name", "").split(" ")[1:]),
         "email": s.get("email", ""),
-        "phone": s.get("phone", ""),
+        # No spaces. Plenty of forms validate a phone field with a pattern that
+        # allows digits and the usual punctuation (+ # - * ) but NOT a space,
+        # and reject the whole submission with "the field accepts only numbers
+        # and phone characters" - seen 2026-09-08 on a site that took the name,
+        # email and message fine and failed only on "+91 9819915555". The plus
+        # and country code are kept: the recipient has to be able to dial back.
+        "phone": re.sub(r"\s+", "", s.get("phone", "")),
         "company": s.get("company", ""),
         "website": s.get("website", ""),
         "city": s.get("city", ""),
+        "state": s.get("state", ""),
+        "designation": s.get("designation", ""),
         "country": s.get("country", ""),
         # A required zip field left blank fails the whole submission - and it is
         # required far more often than it looks, especially on US service sites
