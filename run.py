@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -56,6 +57,46 @@ def log(msg: str, path: Path | None = None) -> None:
             fh.write(line + "\n")
 
 
+# A dead name, a refused port or a host with no route answers the same way on
+# every attempt. Retrying one spends nav_timeout_ms all over again to learn what
+# the first try already settled.
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+_PERMANENT_NAV_ERRORS = (
+    "ERR_NAME_NOT_RESOLVED", "ERR_NAME_RESOLUTION_FAILED",
+    "ERR_ADDRESS_UNREACHABLE", "ERR_CONNECTION_REFUSED",
+)
+
+
+async def host_resolves(url: str, timeout: float = 3.0) -> bool:
+    """Does this host have a DNS record at all?
+
+    Measured on the 74k list: 27% of rows are domains that no longer exist.
+    Asking the browser costs nav_timeout_ms x (nav_retries + 1) - up to 34s -
+    to learn what a DNS lookup settles in milliseconds. Anything unexpected
+    answers True, so a resolver hiccup can never skip a live site.
+    """
+    try:
+        host = urlparse(url if "://" in url else f"https://{url}").hostname
+    except ValueError:
+        return True
+    if not host:
+        return True
+    # Only a plain hostname is safe to rule out this way. Anything stranger is
+    # handed to the browser rather than written off on a lookup it was never
+    # going to pass - being wrong here silently skips a live site.
+    if not _HOSTNAME_RE.match(host):
+        return True
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(loop.getaddrinfo(host, None), timeout)
+        return True
+    except (asyncio.TimeoutError, OSError):
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
 async def open_page(context, url: str, timeout: int, retries: int):
     page = await context.new_page()
     last = ""
@@ -66,13 +107,16 @@ async def open_page(context, url: str, timeout: int, retries: int):
             return page, ""
         except Exception as exc:  # noqa: BLE001
             last = f"{type(exc).__name__}: {str(exc)[:120]}"
+            if any(code in last for code in _PERMANENT_NAV_ERRORS):
+                break
             if attempt < retries:
                 await page.wait_for_timeout(2000)
     return page, last
 
 
 async def locate_form(page, cfg, timeout: int, retries: int, context,
-                      contact_candidates: list | None = None):
+                      contact_candidates: list | None = None,
+                      deadline: float | None = None):
     """Return (page, ranked, contact_url) for the best contact page we can find.
 
     ``ranked`` holds (score, form, frame) triples, best first. The frame is part
@@ -100,8 +144,17 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
         best = (page, ranked, page.url)
 
     for cand in candidates[:limit]:
+        # asyncio.wait_for cannot interrupt a driver call already in flight, so
+        # the per-site ceiling overshoots whenever one is running - measured p50
+        # 55s, max 76s against a 45s setting. Checking the budget between
+        # candidates, and never handing one a timeout that outlives the budget,
+        # is what actually holds a site to its ceiling.
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            break
+        nav_ms = timeout if left is None else max(3000, min(timeout, int(left * 1000)))
         try:
-            resp = await page.goto(cand, wait_until="domcontentloaded", timeout=timeout)
+            resp = await page.goto(cand, wait_until="domcontentloaded", timeout=nav_ms)
             if resp and resp.status >= 400:
                 continue
             await page.wait_for_timeout(1200)
@@ -269,6 +322,11 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     # happen on pages that have already proved they load.
     nav_timeout = int(cfg.path("run", "nav_timeout_ms", default=0) or timeout)
 
+    if not await host_resolves(url):
+        result.update(method="none", status="unreachable",
+                      detail="domain does not resolve (DNS) - no browser attempt made")
+        return result
+
     page, err = await open_page(context, url, nav_timeout, retries)
     if err:
         result.update(method="none", status="unreachable", detail=err)
@@ -295,8 +353,15 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     subject = render_string(env, str(cfg.path("form", "subject_line", default="Enquiry")), ctx)
 
     contact_candidates: list[str] = []
+    # Leave the tail of the budget for the part that actually earns the row -
+    # filling and submitting. A site still hunting for a form this late was
+    # heading for a timeout, which contacts nobody either way.
+    hunt_share = float(cfg.path("run", "form_hunt_share", default=0.85))
+    site_budget = float(cfg.path("run", "site_timeout_s", default=180))
+    deadline = time.monotonic() + site_budget * hunt_share
+
     page, ranked, contact_url = await locate_form(page, cfg, timeout, retries, context,
-                                                  contact_candidates)
+                                                  contact_candidates, deadline)
     result["contact_page"] = contact_url
 
     top_score, top_form, top_frame = (ranked[0] if ranked else (-999, None, None))
