@@ -1065,8 +1065,13 @@ def api_rows():
     agent already produces.
     """
     rows, meta = [], {}
+    proc = STATE["proc"]
+    running = (proc is not None and proc.poll() is None) or _external_run_active()
     preview = STATE.get("preview")
-    if preview:
+    # A live run always wins. Uploading a sheet mid-run used to park the preview
+    # on top of the dashboard, which then sat at "not run yet - 0 done" while the
+    # run was really hours in; the only way back was restarting the service.
+    if preview and not running:
         # a sheet has been uploaded but not run: show it rather than the last run
         rows = preview
         # nothing has run yet, so every counter starts at zero
