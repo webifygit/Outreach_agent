@@ -432,9 +432,16 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
         before_url = page.url
         before_body = await filler.read_context_body(page, frame)
         click = await filler.submit_form(frame, form["form_key"], timeout)
-        status, detail, strength = await filler.verify_submission(
-            page, frame, before_url, form["form_key"], before_body
-        )
+        if click.startswith("no_submit_control"):
+            # Nothing was clicked and requestSubmit() threw, so nothing was sent.
+            # Verifying anyway scored 30 SA sites a success: the page re-rendered,
+            # the form lost its data-agent-form marker, and "form removed from
+            # page" read as a confirmation.
+            status, detail, strength = "failed", "no submit control could be used - nothing was sent", "strong"
+        else:
+            status, detail, strength = await filler.verify_submission(
+                page, frame, before_url, form["form_key"], before_body
+            )
         result["screenshot_after"] = await ev.shot(page, idx, url, "02_after_submit")
         # A required field we never mapped may be exactly what the site needed.
         # A redirect or fresh confirmation text still proves it landed; a form
