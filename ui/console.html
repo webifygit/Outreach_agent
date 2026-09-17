@@ -460,6 +460,26 @@ td .muted { color: var(--ink-3); }
 .toast.ok  { border-color: rgba(16,185,129,.4); }
 .toast.err { border-color: rgba(244,63,94,.45); }
 
+/* A toast that belongs to a control sits under it, with a caret pointing back
+   at the button, so the answer appears where the user is already looking. */
+.toast.anchored { position: fixed; z-index: 61; overflow: visible;
+                  animation: toastDown .22s cubic-bezier(.22,.9,.32,1) both; }
+.toast.anchored.out { animation: toastUp .24s ease forwards; }
+@keyframes toastDown { from { opacity: 0; transform: translateY(-7px) scale(.98); }
+                       to   { opacity: 1; transform: none; } }
+@keyframes toastUp   { to   { opacity: 0; transform: translateY(-7px) scale(.98); } }
+.toast.anchored::before {
+  content: ''; position: absolute; top: -6px; left: var(--caret, 18px);
+  width: 11px; height: 11px; background: rgba(17,22,41,.94);
+  border-left: 1px solid var(--edge); border-top: 1px solid var(--edge);
+  transform: translateX(-50%) rotate(45deg); border-radius: 3px 0 0 0;
+}
+.toast.anchored.ok::before  { border-color: rgba(16,185,129,.4); }
+.toast.anchored.err::before { border-color: rgba(244,63,94,.45); }
+/* the corner stack clips its progress bar to the rounded box; an anchored one
+   shows its overflow for the caret, so the bar rounds itself instead */
+.toast.anchored i.timer { border-radius: 0 0 12px 12px; }
+
 /* --- extra motion: each of these marks a state, not decoration ---------- */
 
 /* panels lift a little under the pointer, so what is interactive looks it */
@@ -577,6 +597,7 @@ tbody tr:hover { transform: translateX(2px); }
   :root[data-theme="light"] .tile { background: #F7F9FE; }
   :root[data-theme="light"] thead th { background: #fff; }
   :root[data-theme="light"] .toast { background: rgba(255,255,255,.97); color: #1F2A44; }
+  :root[data-theme="light"] .toast.anchored::before { background: rgba(255,255,255,.97); }
   :root[data-theme="light"] .shot img { filter: none; }
   :root[data-theme="light"] .drop { border-color: rgba(99,102,241,.4); }
   /* status badges: tinted fills need real contrast on white */
@@ -813,15 +834,77 @@ let lastBounceAt = null, lastReached = null;
 let lastActivityKey = '', lastCounts = {};
 
 /* ---------- toasts -------------------------------------------------------- */
-function toast(title, msg, kind) {
+/* A toast opens directly under the control that caused it, not in a corner the
+   eye has to hunt for. Nearly every toast is the answer to a click, so the
+   triggering control is remembered here rather than threaded through all
+   twenty call sites. A result that lands long after its click - the bounce
+   check finishing - passes its own anchor. Anything with no control behind it
+   still falls back to the corner stack. */
+let lastClick = { el: null, at: 0 };
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('button, input, label, .btn, .tab');
+  if (el) lastClick = { el, at: Date.now() };
+}, true);
+
+const anchoredToasts = [];
+
+function visible(el) {
+  if (!el || !el.isConnected) return null;
+  const r = el.getBoundingClientRect();
+  return (r.width || r.height) ? r : null;
+}
+
+/* Re-run on every add, removal, scroll and resize: an anchored toast has to
+   track its button, and several from one button stack downwards. */
+function layoutToasts() {
+  const used = new Map();               // anchor -> px already taken below it
+  for (const el of anchoredToasts) {
+    const r = visible(el._anchor);
+    if (!r) continue;                   // control went away; leave it be
+    const run = used.get(el._anchor) || 0;
+    const w = el.offsetWidth;
+    const left = Math.max(12, Math.min(r.left, window.innerWidth - w - 12));
+    el.style.left = left + 'px';
+    el.style.top = (r.bottom + 10 + run) + 'px';
+    el.style.setProperty('--caret',
+      Math.max(14, Math.min(r.left + r.width / 2 - left, w - 14)) + 'px');
+    used.set(el._anchor, run + el.offsetHeight + 8);
+  }
+}
+
+function toast(title, msg, kind, anchor) {
   const el = document.createElement('div');
   el.className = 'toast ' + (kind || '');
   el.innerHTML = '<div class="ttl"></div><div class="msg"></div><i class="timer"></i>';
   el.querySelector('.ttl').textContent = title;
   el.querySelector('.msg').textContent = msg || '';
-  $('toasts').appendChild(el);
-  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 300); }, 4000);
+
+  // an explicit anchor wins; otherwise the click this is answering
+  let a = anchor || lastClick.el;
+  if (!visible(a)) a = null;
+
+  if (a) {
+    el.classList.add('anchored');
+    el._anchor = a;
+    document.body.appendChild(el);
+    anchoredToasts.push(el);
+    layoutToasts();
+  } else {
+    $('toasts').appendChild(el);
+  }
+
+  setTimeout(() => {
+    el.classList.add('out');
+    setTimeout(() => {
+      el.remove();
+      const i = anchoredToasts.indexOf(el);
+      if (i > -1) { anchoredToasts.splice(i, 1); layoutToasts(); }
+    }, 300);
+  }, 4000);
 }
+
+addEventListener('scroll', () => { if (anchoredToasts.length) layoutToasts(); }, true);
+addEventListener('resize', () => { if (anchoredToasts.length) layoutToasts(); });
 
 /* ---------- animated number ---------------------------------------------- */
 function setNumber(el, value) {
@@ -992,11 +1075,12 @@ async function refresh() {
     bBtn.textContent = 'Check bounces';
     if (bounce.done_at && bounce.done_at !== lastBounceAt) {
       lastBounceAt = bounce.done_at;
-      if (bounce.error) toast('Bounce check problem', bounce.error, 'err');
+      if (bounce.error) toast('Bounce check problem', bounce.error, 'err', bBtn);
       else if (bounce.bounced > 0)
         toast('Undeliverable found', bounce.bounced + ' of ' + bounce.checked +
-              ' address(es) bounced - marked failed', 'ok');
-      else toast('No bounces', 'Everything sent was accepted (' + bounce.checked + ' checked)', 'ok');
+              ' address(es) bounced - marked failed', 'ok', bBtn);
+      else toast('No bounces', 'Everything sent was accepted (' + bounce.checked + ' checked)',
+                 'ok', bBtn);
     }
   }
 
@@ -1303,7 +1387,8 @@ try {
     sb.checked = false;
     sb.addEventListener('change', () => {
       if (sb.checked) toast('Browser windows will open',
-                            'One window per site. Fine for watching a few, not for a full sheet.', 'warn');
+                            'One window per site. Fine for watching a few, not for a full sheet.',
+                            'warn', sb);
     });
   }
   if ($('live')) $('live').checked = false;
