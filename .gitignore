@@ -31,6 +31,7 @@ __pycache__/
 output/
 evidence/
 uploads/
+nyc_agencies_output/
 
 # OS
 .DS_Store

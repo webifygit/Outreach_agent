@@ -1,0 +1,149 @@
+HOW TO RUN  scrape_nyc_agencies.py
+==================================
+
+What it does: collects the website URLs of digital marketing agencies in
+New York City from Google Maps, and sorts them so the bigger agencies come
+first. You get a CSV and Excel files at the end.
+
+Time needed: about 10 minutes to set up (once), then about 75 minutes to run.
+You can leave it running and do other work.
+
+
+------------------------------------------------------------
+STEP 1 - Put the file in a folder                (Finder / File Explorer)
+------------------------------------------------------------
+Make a new folder on your Desktop called
+
+    nyc_scraper
+
+and put scrape_nyc_agencies.py inside it.
+
+
+------------------------------------------------------------
+STEP 2 - Check you have Python                   (Terminal / Command Prompt)
+------------------------------------------------------------
+MAC:      open the "Terminal" app, paste this, press Enter:
+
+    python3 --version
+
+WINDOWS:  open "Command Prompt", paste this, press Enter:
+
+    py --version
+
+If it prints "Python 3.9" or any higher number, go to STEP 3.
+
+If it prints an error, install Python from  https://www.python.org/downloads/
+(WINDOWS: on the first installer screen, tick "Add python.exe to PATH".)
+Then close the Terminal / Command Prompt window, open a new one, and do this
+step again.
+
+
+------------------------------------------------------------
+STEP 3 - Install what the script needs (once)    (same Terminal window)
+------------------------------------------------------------
+Paste the first line, press Enter, wait until it finishes. Then the second.
+
+MAC:
+    python3 -m pip install playwright openpyxl
+    python3 -m playwright install chromium
+
+WINDOWS:
+    py -m pip install playwright openpyxl
+    py -m playwright install chromium
+
+The second line downloads a browser (about 150 MB). It is only used by this
+script and does not touch your normal Chrome.
+
+
+------------------------------------------------------------
+STEP 4 - Go to the folder                        (same Terminal window)
+------------------------------------------------------------
+MAC:
+    cd ~/Desktop/nyc_scraper
+
+WINDOWS:  close Command Prompt. Open the nyc_scraper folder in File Explorer,
+          click once on the address bar at the top, type  cmd  and press Enter.
+          A Command Prompt opens already inside the folder.
+
+
+------------------------------------------------------------
+STEP 5 - Run it                                  (same Terminal window)
+------------------------------------------------------------
+MAC:
+    python3 scrape_nyc_agencies.py
+
+WINDOWS:
+    py scrape_nyc_agencies.py
+
+You will see one line per search, like this:
+
+    [12/152] digital marketing agency in Chelsea, Manhattan, New York, NY
+             - 120 cards -> 873 unique websites so far (~58 min left)
+
+Keep the window open and the computer awake until it prints "list" and
+"rejects" at the end.
+
+Short on time? Add --quick to the end of the command. It takes about
+20 minutes but finds roughly half as many agencies.
+
+
+------------------------------------------------------------
+STEP 6 - Get the results                         (Finder / File Explorer)
+------------------------------------------------------------
+Open the new folder  nyc_agencies_output  inside  nyc_scraper.
+
+    nyc_agencies part 1 of N.xlsx   <- THE LIST. Split into files of 900 rows
+                                       because Google Sheets refuses bigger
+                                       uploads. Send / upload these.
+    nyc_agencies.csv                   the same list in one file
+    nyc_agencies_rejects.csv           what was dropped, and why
+    nyc_agencies_raw.csv               everything scraped - keep it, do not edit
+    (the other files are the script's own notes - leave them)
+
+
+------------------------------------------------------------
+READING THE LIST
+------------------------------------------------------------
+website        the URL - this is the column you want
+size_tier      likely mid-large / possible / likely small / unknown / dead site
+size_signals   WHY it got that tier (careers page, hiring system, team page,
+               offices in other cities ...)
+
+The list is already sorted, biggest first. For mid-to-large agencies, filter
+size_tier to "likely mid-large" and "possible".
+
+Be aware: Google Maps does not publish company size, so size_tier is an
+estimate from each agency's homepage, not a headcount. Expect some mistakes
+in both directions.
+
+    "unknown"    the site blocks automated visitors, so it could not be
+                 checked. These are often larger agencies - open them by hand.
+    "dead site"  the domain no longer exists. Skip these.
+
+
+------------------------------------------------------------
+IF SOMETHING GOES WRONG
+------------------------------------------------------------
+It stopped, or I closed the window by mistake
+    Do STEP 4 and STEP 5 again. It continues from where it stopped -
+    nothing is lost and nothing is scraped twice.
+
+I want to stop it myself
+    Press Ctrl+C once. It saves the list from what it has so far.
+
+It says "BLOCKED by Google" and stops
+    Google is rate-limiting you. Wait one hour, then do STEP 5 again.
+    If it happens a second time, run it with the browser visible and solve
+    the "I'm not a robot" check once when it appears:
+        MAC:      python3 scrape_nyc_agencies.py --headful
+        WINDOWS:  py scrape_nyc_agencies.py --headful
+
+It says "Playwright is not installed"
+    STEP 3 was skipped or failed. Do STEP 3 again.
+
+"python3" or "py" is not recognized
+    Python is not installed, or the window was opened before installing it.
+    Do STEP 2 again in a NEW window.
+
+I want to start completely fresh
+    Delete the nyc_agencies_output folder, then do STEP 5.
