@@ -48,6 +48,8 @@ def configured(cfg) -> list[dict]:
             "email": item.get("email") or {},
             "form": item.get("form") or {},
             "follow_up": bool(item.get("follow_up")),
+            # optional: which form_senders keys this script may go out under
+            "senders": [str(k).strip() for k in (item.get("senders") or []) if str(k).strip()],
         })
     return out
 
@@ -117,5 +119,20 @@ def apply(cfg, key: str | None) -> tuple[str, str]:
         for name in allowed:
             if name in (chosen.get(block) or {}):
                 section[name] = chosen[block][name]
+
+    # A script may name the form identities it goes out under (`senders:` -
+    # a list of form_senders keys). Absent, the whole pool rotates as before.
+    # A key that matches nobody is a config error, not a silent fallback.
+    only = chosen.get("senders") or []
+    if only:
+        pool = cfg.get("form_senders") or []
+        known = {str(p.get("key", "")).strip() for p in pool}
+        missing = [k for k in only if k not in known]
+        if missing:
+            raise ValueError(
+                f"script {chosen['key']!r} names sender(s) not in form_senders: "
+                + ", ".join(missing)
+            )
+        cfg["form_senders"] = [p for p in pool if str(p.get("key", "")).strip() in only]
 
     return chosen["key"], chosen["label"]
