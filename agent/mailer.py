@@ -28,6 +28,10 @@ class Mailer:
         self.port = int(cfg.path("email", "smtp_port", default=587))
         self._smtp: dict[str, smtplib.SMTP] = {}  # keyed by sender email, reused across sends
 
+    # Set by run.py to state.contacted_address. Left None, the mailer simply
+    # does not deduplicate - it never invents its own history.
+    already_contacted = None
+
     def preflight(self) -> str:
         if not self.cfg.path("email", "enabled", default=True):
             return "email disabled in config"
@@ -68,9 +72,12 @@ class Mailer:
         msg["To"] = to_addr
         msg["Subject"] = subject
         msg["Message-ID"] = make_msgid()
-        msg["Reply-To"] = from_email
+        # Replies should land wherever the signature points. The From header
+        # has to stay on the authenticated mailbox - Gmail rejects anything
+        # else - so Reply-To is what actually routes the answer.
+        msg["Reply-To"] = sender.get("signature_email") or from_email
         # Gives recipients a one-click opt-out and keeps mailbox providers happier.
-        msg["List-Unsubscribe"] = f"<mailto:{from_email}?subject=unsubscribe>"
+        msg["List-Unsubscribe"] = f"<mailto:{msg['Reply-To']}?subject=unsubscribe>"
         msg.set_content(body)
         if html:
             msg.add_alternative(html, subtype="html")
@@ -80,6 +87,23 @@ class Mailer:
         return msg
 
     def send(self, to_addr: str, subject: str, body: str, html: str, sender: dict) -> tuple[str, str]:
+        # email.enabled was only ever a preflight warning, so a config that
+        # said email was off still sent. It is enforced here, at the one place
+        # every send passes through.
+        if not self.cfg.path("email", "enabled", default=True):
+            return "skipped_no_email", ("email sending is switched off "
+                                        f"(email.enabled: false) - {to_addr} not contacted")
+
+        # Last line of defence, checked for every send regardless of which
+        # mailbox is sending: the lookup is keyed on the recipient, so an
+        # address written to by one sender is closed to all of them.
+        prior = self.already_contacted(to_addr) if self.already_contacted else None
+        if prior:
+            when = str(prior.get("timestamp", ""))[:10]
+            return "skipped_duplicate", (
+                f"{to_addr} was already emailed on {when} "
+                f"(via {prior.get('website', '?')}, sent by {prior.get('sender_email', '?')}) - not sending again")
+
         msg = self.build(to_addr, subject, body, html, sender)
         from_email = sender.get("email", "?")
         if not self.live:

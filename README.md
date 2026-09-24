@@ -31,6 +31,7 @@ python run.py --input leads.xlsx                      # DRY RUN - default, nothi
 python run.py --input leads.xlsx --limit 5 --no-headless   # watch the browser work
 export SMTP_PASSWORD_TARANNUM='...' SMTP_PASSWORD_MOHAMMED='...' SMTP_PASSWORD_IRSHAD='...'
 python run.py --input leads.xlsx --live               # for real
+python run.py --input pest_uk.xlsx --script pest_control   # a different pitch
 ```
 
 Dry run does everything except click submit and send: it still finds the form,
@@ -77,6 +78,48 @@ Every template sees the currently-picked identity as `sender.*` (`sender.name`,
 came from depends on whether the template is being rendered for the form fill
 or the email fallback.
 
+## Pitch scripts
+
+A sheet of pest control companies wants the pest control pitch; a mixed sheet
+wants the general one. A **script** is one campaign's wording - the subject
+lines and the message templates - and nothing else:
+
+```yaml
+default_script: general        # what a run gets when nobody picked one
+
+scripts:
+  - key: pest_control
+    label: "Pest control"
+    blurb: "Leads with the Pest Stop Control build - for pest control sheets only"
+    form:
+      subject_line: "Helping Your Pest Control Business Grow Online"
+      message_tiers:
+        full:     "templates/pest_control/form_message_full.txt.j2"
+        medium:   "templates/pest_control/form_message_medium.txt.j2"
+        short:    "templates/pest_control/form_message_700.txt.j2"
+        shortest: "templates/pest_control/form_message_500.txt.j2"
+    email:
+      subject_template: "Helping Your Pest Control Business Grow Online"
+      body_template_path: "templates/pest_control/email_body.txt.j2"
+      html_template_path: "templates/pest_control/email_body_html.j2"
+```
+
+Pick one per run: the **Pitch script** buttons in the console, or `--script <key>`
+on the command line. The console preselects whatever the last run used, and the
+buttons lock while a run is in flight - the wording is fixed once it starts.
+Resume and "submit dry runs live" carry the same script forward, so one sheet
+never goes out in two different letters. An unknown key stops the run rather
+than quietly falling back to the default.
+
+Only the five wording keys above are read from a script. Delivery settings -
+`email.enabled`, `daily_limit`, SMTP, `form.require_message` - stay in the
+top-level `form:`/`email:` blocks and are shared by every script, so changing
+the pitch in the UI can never switch paused email back on.
+
+To add a script: drop the templates in `templates/<your_key>/`, add an entry to
+`scripts:` in `config.local.yaml`, and reload the console - the picker reads the
+config fresh on every page load, so no restart is needed.
+
 ## Templates
 
 All Jinja2. Every spreadsheet column is a variable, plus `sender.*` and
@@ -87,6 +130,11 @@ All Jinja2. Every spreadsheet column is a variable, plus `sender.*` and
 - `templates/form_message_700.txt.j2` - fits forms capped around ~700 characters
 - `templates/form_message_500.txt.j2` - fits forms capped around ~500 characters
 - `templates/email_body.txt.j2` - the email fallback (no length limit, so it's full-length)
+- `templates/email_body_html.j2` - optional HTML alternative, with the logo signature
+- `templates/pest_control/*` - the same five files in the pest control wording
+
+Those are the general script's files; each pitch script points at its own set
+(see **Pitch scripts** above).
 
 The agent reads the target form's message-field `maxlength` (when the site
 sets one) and automatically uses the largest tier that fits - no limit found
@@ -103,6 +151,10 @@ the last full word inside the limit. Tune the mapping in `config.yaml` under
   and a `.txt` copy of every email body sent
 - `output/state.json` - progress; a re-run resumes and skips completed rows
 
+A run refuses to start in live mode while `config.yaml`'s placeholder identity
+is still in place, and warns about it on every dry run - filling real contact
+forms as "First Person" from "Your Company Pvt Ltd" is worse than not running.
+
 ### Status values
 
 | status | meaning |
@@ -117,7 +169,10 @@ the last full word inside the limit. Tune the mapping in `config.yaml` under
 
 ## How form detection works
 
-1. Load the homepage, score every `<form>` on it.
+1. Load the homepage, score every `<form>` on it - in the main document **and
+   inside every iframe**, so third-party embeds (HubSpot, Jotform, Google Forms,
+   Formstack, ...) are found like any other form. Ad and analytics iframes are
+   skipped, and a hosted form provider adds to the score.
 2. If nothing scores well, follow links matching *contact / get in touch /
    enquiry*, then try `/contact`, `/contact-us`, etc.
 3. Scoring rejects search boxes, login forms, and single-field newsletter signups.
@@ -126,6 +181,9 @@ the last full word inside the limit. Tune the mapping in `config.yaml` under
 5. **Hidden fields are never filled** - most are honeypots, and filling one is the
    fastest way to be silently classified as a bot.
 6. Required consent checkboxes are ticked; marketing opt-ins are not.
+7. Filling, submitting and confirmation-reading are all scoped to the document
+   that owns the form, so an embedded form's "thanks, we got it" - which renders
+   inside the iframe and never appears in the parent page's text - is still read.
 
 ## Local LLM personalization (optional, no API key)
 
@@ -164,8 +222,14 @@ Jotform), the page is behind Cloudflare, or the fields are unlabelled.
 
 - **CAPTCHA-protected forms are skipped by design.** The agent falls back to
   email rather than trying to defeat the check.
-- **iframe-embedded forms** (HubSpot/Typeform/Jotform) are not filled by the
-  current extractor - it only reads the main frame. If many of your targets use
-  these, extend `locate_form` to loop over `page.frames`.
+- **Forms with no message box are skipped too** (`form.require_message`, on by
+  default). They can only carry a name and an address, which delivers nothing -
+  the email fallback sends the full pitch instead.
+- **Forms hidden until a click** (inside a modal, tab or accordion) are not
+  filled - the extractor only considers fields that are visible when the page
+  settles, and an unopened form has none. `wpforms.com/contact/` is an example.
+- **Typeform-style one-question-at-a-time embeds** are found but not usefully
+  filled: there is no single form to complete, only a wizard that reveals the
+  next question after each answer.
 - `uncertain` is a real and common outcome. Some sites give no confirmation at
   all. Sample the screenshots rather than trusting the count.

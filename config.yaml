@@ -11,10 +11,36 @@ run:
                            # live    = actually submit forms and send email
   headless: true
   max_sites: 0             # 0 = process every row
-  delay_between_sites: [8, 20]   # random pause (seconds) - be polite, avoid rate limits
+  delay_between_sites: [4, 10]   # pause between two sites. They are
+                            # different companies on different hosting,
+                            # so this is caution, not rate limiting
   page_timeout_ms: 30000
+  nav_timeout_ms: 20000    # ceiling for OPENING a site only. Lower than
+                          # page_timeout_ms so dead hosts fail fast, while
+                          # clicks and form fills keep the longer limit
+  site_timeout_s: 180     # hard ceiling per site - a page that wedges the
+                          # extractor is recorded as 'timeout' and skipped
+  workers: 1                  # how many sites to work on at once. Each one
+                              # drives its own browser (~1.5 GB), and almost all
+                              # of a site is spent waiting on the network, so 3
+                              # is roughly 3x faster. 1 = one site at a time
+  recycle_browser_every: 25   # retire the browser every N sites - long runs
+                              # leak memory until Chromium falls over
+  browser_channel: ""        # which browser to drive: "" = the one Playwright
+                              # ships, "msedge"/"chrome" = an installed one
+  max_consecutive_errors: 6   # stop the run if this many sites fail back to back,
+                              # rather than recording failures for untried rows
+  stall_timeout_s: 600        # if a run writes nothing for this long it is
+                              # wedged - kill it and carry on from where it stopped
+  adaptive_settle: true       # stop waiting as soon as a form appears, rather
+                              # than always pausing for the full time. A page
+                              # that never shows one still waits it out
   nav_retries: 2
   resume: true             # skip rows already marked done in output/state.json
+  skip_already_contacted: true  # never contact a site, or an email address,
+                                # that an earlier run already reached
+  dedupe_scope: host            # host = one message per website (www/https/trailing
+                                # slash all collapse); url = per exact page
 
 # Shared across every sender identity below.
 organization:
@@ -25,6 +51,12 @@ organization:
   state: "Your State"
   country: "Your Country"
   pitch: "One line describing what you offer and to whom."
+  # Optional links shown in the email signature. Any left blank is omitted
+  # rather than rendered as a dead link.
+  bot_store_url: ""
+  bot_store_title: ""
+  bot_store_blurb: ""
+  linkedin_url: ""
 
 # --- Two separate identity pools ---------------------------------
 #
@@ -68,6 +100,50 @@ llm:
   max_hook_chars: 220
   use_site_content: true           # scrape homepage title/meta/h1 as extra context for the hook
 
+# --- Pitch scripts -----------------------------------------------
+#
+# A script is one campaign's WORDING - the subject lines and the message
+# templates - and nothing else. Which one a run uses is picked in the console,
+# or with --script on the command line; default_script is what a run gets when
+# nothing was picked.
+#
+# Delivery settings stay in the form:/email: blocks below and are shared by
+# every script, so choosing a different pitch can never switch email back on
+# or change the daily limit.
+
+default_script: general
+
+scripts:
+  - key: general
+    label: "General digital growth"
+    blurb: "Websites, AI agents, SEO/AEO - any industry"
+    form:
+      subject_line: "Partnership enquiry"
+      message_tiers:
+        full: "templates/form_message_full.txt.j2"
+        medium: "templates/form_message_medium.txt.j2"
+        short: "templates/form_message_700.txt.j2"
+        shortest: "templates/form_message_500.txt.j2"
+    email:
+      subject_template: "Partnership enquiry"
+      body_template_path: "templates/email_body.txt.j2"
+      html_template_path: ""
+
+  - key: pest_control
+    label: "Pest control"
+    blurb: "Leads with the Pest Stop Control build - for pest control sheets only"
+    form:
+      subject_line: "Helping Your Pest Control Business Grow Online"
+      message_tiers:
+        full: "templates/pest_control/form_message_full.txt.j2"
+        medium: "templates/pest_control/form_message_medium.txt.j2"
+        short: "templates/pest_control/form_message_700.txt.j2"
+        shortest: "templates/pest_control/form_message_500.txt.j2"
+    email:
+      subject_template: "Helping Your Pest Control Business Grow Online"
+      body_template_path: "templates/pest_control/email_body.txt.j2"
+      html_template_path: ""
+
 form:
   subject_line: "Partnership enquiry"
   # Rendered with Jinja2 - same variables as the email template. The agent
@@ -78,6 +154,12 @@ form:
     medium: "templates/form_message_medium.txt.j2"     # fits under ~1000 chars
     short: "templates/form_message_700.txt.j2"         # fits under ~700 chars
     shortest: "templates/form_message_500.txt.j2"      # fits under ~500 chars
+  messageless_on_followup: false  # keep a message-less form as a last resort on
+                                  # a first touch only; never on a follow-up,
+                                  # where an empty enquiry says nothing yet
+                                  # still scores as a success.
+  require_message: true   # a form with no message box can't carry the pitch -
+                          # send the email instead. false = submit it anyway.
   skip_if_captcha: true    # if a CAPTCHA is present, don't fight it - fall back to email
   accept_consent_checkboxes: true
   max_contact_pages_to_try: 6
@@ -100,4 +182,8 @@ paths:
   results_path: "output/results.xlsx"
   state_path: "output/state.json"
   log_path: "output/run.log"
-  report_path: "output/report.html"
+  report_path: "output/report.html"   # this sheet only
+  report_all_path: "output/report_all.html"   # every sheet ever run
+  ledger_path: "output/contacted.xlsx"   # forms / emails / skipped, one sheet each
+  lock_path: "output/run.lock"   # pid file so the UI can see a CLI run too
+  rows_json_path: "output/run_rows.json"   # console feed for the current sheet

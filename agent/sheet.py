@@ -18,7 +18,12 @@ from urllib.parse import urlparse
 import pandas as pd
 
 ALIASES = {
-    "website": {"website", "url", "site", "web", "domain", "website link", "link", "weblink"},
+    # Plurals included: scraped exports (Google Maps, Apify and friends) label
+    # the column WEBSITES, and the loader used to reject the whole sheet with
+    # "No website column found" rather than take the obvious match.
+    "website": {"website", "websites", "url", "urls", "site", "sites", "web", "domain",
+                "domains", "website link", "website url", "link", "links", "weblink",
+                "web address", "homepage"},
     "company_name": {"company_name", "company", "company name", "name", "organisation",
                      "organization", "business", "client", "client name"},
     "email": {"email", "e-mail", "email id", "email address", "mail", "contact email"},
@@ -92,7 +97,11 @@ def load_rows(path: str | Path) -> tuple[list[dict], list[dict]]:
             skipped.append({"row_index": i + 2, "website": str(raw_website)})
             continue
         rec["website"] = url
-        rec["company_name"] = str(rec.get("company_name") or "").strip() or company_from_url(url)
+        given = str(rec.get("company_name") or "").strip()
+        # A domain-derived name is a guess, not the company's own name -
+        # flagged so the page can be asked for something better.
+        rec["company_from_sheet"] = bool(given)
+        rec["company_name"] = given or company_from_url(url)
         rec["row_index"] = i + 2  # spreadsheet row number, header is row 1
         contact = str(rec.get("contact_name") or "").strip()
         rec["contact_first_name"] = contact.split()[0] if contact else ""

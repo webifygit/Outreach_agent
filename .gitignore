@@ -2,6 +2,25 @@
 config.local.yaml
 .env.local
 .flask_secret
+# ...and any backup of them. A timestamped copy is still the real thing.
+config.local.yaml.bak*
+.env.local.bak*
+*.bak
+*.bak[0-9]
+# Timestamped safety copies (foo.py.bak.184338, foo.py.bak3.185016, dirs too).
+# The bare *.bak above only catches names ENDING in .bak, which none of these do.
+*.bak.*
+*.bak[0-9].*
+*.bak.*/
+# Source copy of the approved outreach copy - contains real names, addresses
+# and phone numbers for the team, so it stays out of a public repo.
+templates/contactform_details.txt
+# Lead lists are client data, not code.
+leads_*.xlsx
+leads_*.csv
+# Scraped lead lists are the same thing under another name.
+*_raw.csv
+*_rejects.csv
 
 # Python
 __pycache__/
@@ -12,6 +31,9 @@ __pycache__/
 output/
 evidence/
 uploads/
+nyc_agencies_output/
+austin_dtc_output/
+utah_ecommerce_output/
 
 # OS
 .DS_Store

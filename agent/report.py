@@ -304,6 +304,18 @@ PAGE = Template(r"""<!doctype html>
     outline: 2px solid var(--accent); outline-offset: 2px;
   }
 </style>
+<script>
+  /* The console stores the chosen theme; every page here follows it. Runs
+     before paint so there is no flash of the wrong palette. */
+  (function () {
+    try {
+      var t = localStorage.getItem('webifyTheme');
+      document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
+    } catch (e) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  })();
+</script>
 
 <div class="bg-blobs" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
 

@@ -42,3 +42,29 @@ def render_file(env: Environment, cfg, rel_path: str, ctx: dict) -> str:
 
 def render_string(env: Environment, text: str, ctx: dict) -> str:
     return env.from_string(text).render(**ctx).strip()
+
+
+def presentable_company(name: str) -> bool:
+    """Is this a name we can put in front of a stranger?
+
+    Single-word brands are fine (Sodexo, Lombard). A long run-together string
+    is a domain we split badly ("Secondliftingequipment"), and greeting someone
+    by it looks automated - which it is, but it should not look it.
+    """
+    name = (name or "").strip()
+    if not name or len(name) > 60:
+        return False
+    if " " in name:
+        return True
+    return len(name) <= 14
+
+
+def greeting_for(company_name: str, contact_first_name: str = "") -> str:
+    """Who the email says hello to."""
+    first = (contact_first_name or "").strip()
+    if first:
+        return first
+    company = (company_name or "").strip()
+    if presentable_company(company):
+        return f"{company} team"
+    return "Team"

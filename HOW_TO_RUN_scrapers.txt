@@ -1,0 +1,212 @@
+HOW TO RUN THE THREE SCRAPERS
+=============================
+
+    scrape_nyc_agencies.py     New York City - digital marketing agencies, mid-to-large first
+    scrape_austin_dtc.py       Austin, Texas - DTC brands and e-commerce companies
+    scrape_utah_ecommerce.py   Salt Lake City / Silicon Slopes, Utah - tech-forward retail
+                               and e-commerce companies
+
+What they do: collect website URLs from Google Maps, clean them, read every
+homepage once so the best come first, and write a CSV plus Excel files of
+900 rows each. They are built for volume: each stops on its own once it has
+10,000 unique websites, or when it runs out of searches.
+
+Time needed: about 10 minutes to set up (once). Then, per script, up to a
+day of searching (see TIME below) plus 1-2 hours reading homepages. You can
+stop and restart at any time - nothing is lost and nothing is scraped twice.
+Run ONE script at a time on one PC. Three PCs can each run one.
+
+
+------------------------------------------------------------
+STEP 1 - Put the files in a folder                (File Explorer)
+------------------------------------------------------------
+Make a new folder on your Desktop called
+
+    scrapers
+
+and put the three .py files in it. Each script makes its own output folder
+next to itself, so they never mix.
+
+
+------------------------------------------------------------
+STEP 2 - Check you have Python                   (Command Prompt)
+------------------------------------------------------------
+Open "Command Prompt", paste this, press Enter:
+
+    py --version
+
+If it prints "Python 3.9" or any higher number, go to STEP 3.
+
+If it prints an error, install Python from  https://www.python.org/downloads/
+On the first installer screen, tick "Add python.exe to PATH". Then close the
+Command Prompt window, open a new one, and do this step again.
+
+(On a Mac: use "Terminal" and write  python3  wherever this guide says  py )
+
+
+------------------------------------------------------------
+STEP 3 - Install what the scripts need (once)    (same window)
+------------------------------------------------------------
+Paste the first line, press Enter, wait until it finishes. Then the second.
+
+    py -m pip install playwright openpyxl
+    py -m playwright install chromium
+
+The second line downloads a browser (about 150 MB). It is only used by these
+scripts and does not touch your normal Chrome.
+
+
+------------------------------------------------------------
+STEP 4 - Go to the folder                        (File Explorer)
+------------------------------------------------------------
+Close Command Prompt. Open the  scrapers  folder in File Explorer, click once
+on the address bar at the top, type  cmd  and press Enter. A Command Prompt
+opens already inside the folder.
+
+
+------------------------------------------------------------
+STEP 5 - Run it                                  (same window)
+------------------------------------------------------------
+One of these, depending on the list you want:
+
+    py scrape_nyc_agencies.py
+    py scrape_austin_dtc.py
+    py scrape_utah_ecommerce.py
+
+You will see one line per search, like this:
+
+    [312/4880] SEO agency in 10014, NY - 87 cards -> 4210 unique websites so far (~31 h left)
+
+Keep the window open and the PC awake: Settings > System > Power > Screen and
+sleep > "never" while plugged in. When the searching ends it prints
+"shop check: reading N homepages" (New York: "size check") - that part takes
+1-2 hours. It is finished when it prints "list" and "rejects" at the end.
+
+Faster:   add  --parallel 2  to the end of the command. Two tabs search at
+          once, so it takes half the time. Google may block more often; the
+          script then waits and carries on by itself.
+              py scrape_austin_dtc.py --parallel 2
+
+More or less:  --target 20000   keeps searching until 20,000 websites
+               --target 0       searches everything there is
+               --target 5000    stops at 5,000
+          The target is counted BEFORE cleaning, so the final list is shorter
+          (chains, marketplaces and wrong trades are removed). For a final list
+          of about 10,000, use  --target 14000.
+
+A taster: add  --quick  (2 search terms, named areas only, about 45 minutes,
+          roughly 1,000-1,500 rows).
+
+
+------------------------------------------------------------
+TIME
+------------------------------------------------------------
+One tab, if nothing stops it early. --parallel 2 halves it; --target usually
+ends it sooner.
+
+    New York   4,880 searches   up to ~40 h
+    Austin     1,900 searches   up to ~16 h
+    Utah       2,240 searches   up to ~19 h
+
+A search takes about 30 seconds and Google Maps shows at most ~120 results
+per search. That is why each script runs thousands of small searches - 20
+search terms x every neighbourhood and ZIP code in the metro - and merges
+them. A search that finds nothing costs a few seconds.
+
+
+------------------------------------------------------------
+STEP 6 - Get the results                         (File Explorer)
+------------------------------------------------------------
+Open the new folder next to the script:  nyc_agencies_output,
+austin_dtc_output  or  utah_ecommerce_output.
+
+    <name> part 1 of N.xlsx   <- THE LIST. Split into files of 900 rows
+                                 because Google Sheets refuses bigger
+                                 uploads. Send / upload these.
+    <name>.csv                   the same list in one file
+    <name>_rejects.csv           what was dropped, and why - worth a look
+    <name>_raw.csv               everything scraped - keep it, do not edit.
+                                 The list can be rebuilt from it without
+                                 scraping again:  py scrape_austin_dtc.py --rebuild
+    (the other files are the script's own notes - leave them)
+
+
+------------------------------------------------------------
+READING THE LISTS
+------------------------------------------------------------
+All three:
+    website            the URL - this is the column you want
+    company_name, area, address, phone, category, rating, reviews
+    searches_seen_in   how many searches showed it; higher = more established
+
+New York:
+    size_tier          likely mid-large / possible / likely small / unknown / dead site
+    size_signals       WHY: careers page, hiring system, team page, offices in
+                       other cities ...
+    For mid-to-large agencies, filter size_tier to "likely mid-large" and
+    "possible".
+
+Austin and Utah:
+    sells_online       yes = an online shop was found on the homepage (the
+                       platform column names it, e.g. Shopify, WooCommerce)
+                       maybe = one hint only
+                       no = none found - kept at the bottom of the list so
+                       you can check by hand; some brands sell only through
+                       an app or a separate shop site
+                       unknown = the site blocks robots or did not load
+                       For DTC / e-commerce lists, filter to yes and maybe.
+    growth_tier        strong signals / some signals / few signals /
+                       unknown / dead site
+    signals            WHY: hiring system, careers page, press, wholesale or
+                       stockists, Amazon store, mobile app, subscriptions,
+                       funding or hiring wording
+    aggregator         "aggregator?" when the homepage says the company
+                       acquires or holds a portfolio of brands
+    locations_on_maps  how many addresses Maps has for it in the metro
+                       (5 or more = treated as a chain and dropped; those sit
+                       in the rejects file in case one is a local brand)
+
+The lists are already sorted, best first. Be aware: Google Maps does not
+publish company size or revenue, so every tier is an estimate from each
+homepage, not a fact. Expect some mistakes in both directions.
+
+    "unknown"    the site blocks automated visitors, so it could not be
+                 checked. These are often bigger companies - open by hand.
+    "dead site"  the domain no longer exists. Skip these.
+
+
+------------------------------------------------------------
+IF SOMETHING GOES WRONG
+------------------------------------------------------------
+It stopped, or I closed the window by mistake
+    Do STEP 4 and STEP 5 again. It continues from where it stopped -
+    nothing is lost and nothing is scraped twice.
+
+I want to stop it myself
+    Press Ctrl+C once. It builds the list from what it has so far. Run the
+    same command later to carry on.
+
+It printed "Target reached" and built the list
+    That is the 10,000 stop. To keep going:  py scrape_austin_dtc.py --target 0
+
+It says "BLOCKED by Google" and stops
+    Google is rate-limiting you. Wait one hour, then do STEP 5 again.
+    If it happens a second time, run it with the browser visible and solve
+    the "I'm not a robot" check once when it appears:
+        py scrape_austin_dtc.py --headful
+    If you were using --parallel 2, drop it for a while.
+
+It says "Playwright is not installed"
+    STEP 3 was skipped or failed. Do STEP 3 again.
+
+"py" is not recognized
+    Python is not installed, or the window was opened before installing it.
+    Do STEP 2 again in a NEW window.
+
+I want to start completely fresh
+    Delete that script's output folder, then do STEP 5.
+
+I want a different city or different search terms
+    Any script takes its own areas and terms, semicolon-separated:
+        py scrape_austin_dtc.py --locations "Houston, TX;Katy, TX" --name houston_dtc
+        py scrape_nyc_agencies.py --queries "branding agency;PR agency"
