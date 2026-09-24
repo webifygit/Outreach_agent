@@ -32,6 +32,8 @@ output/
 evidence/
 uploads/
 nyc_agencies_output/
+austin_dtc_output/
+utah_ecommerce_output/
 
 # OS
 .DS_Store

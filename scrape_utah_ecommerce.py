@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Website URLs of digital marketing agencies in New York City - one file, built for volume.
+"""Website URLs of tech-forward retail and e-commerce companies in Salt Lake City and Silicon Slopes, Utah - one file, built for volume.
 
 SETUP (once)
     Mac:      python3 -m pip install playwright openpyxl
@@ -8,43 +8,51 @@ SETUP (once)
               py -m playwright install chromium
 
 RUN
-    python3 scrape_nyc_agencies.py            (Windows: py scrape_nyc_agencies.py)
+    python3 scrape_utah_ecommerce.py              (Windows: py scrape_utah_ecommerce.py)
 
     Stop it with Ctrl+C whenever you like and run the same command again - it
     carries on from the search it had reached. Everything lands in the folder
-    nyc_agencies_output/ next to this file:
+    utah_ecommerce_output/ next to this file:
 
-    nyc_agencies.csv               the list: one row per agency, best first
-    nyc_agencies part 1 of N.xlsx  same list in 900-row pieces (Google Sheets
+    utah_ecommerce.csv                 the list: one row per company, best first
+    utah_ecommerce part 1 of N.xlsx    same list in 900-row pieces (Google Sheets
                                    refuses an import over 1,000 rows)
-    nyc_agencies_rejects.csv       everything dropped, with the reason - read it
-    nyc_agencies_raw.csv           every Maps card as scraped; keep it, the
+    utah_ecommerce_rejects.csv         everything dropped, with the reason - read it
+    utah_ecommerce_raw.csv             every Maps card as scraped; keep it, the
                                    list can be rebuilt from it without re-scraping
 
 HOW IT WORKS
-    1. Google Maps caps one search at ~120 results, so "agencies in New York"
-       would return 120 of several thousand. Instead it runs 20 search terms
-       (digital marketing, advertising, SEO, branding, web design, PR, video
-       production ...) once per neighbourhood AND once per ZIP code - about
-       4,900 small overlapping searches - and merges them. The website is read
-       straight off the result card - no place page is opened - which is ~36x
-       faster and far less likely to get blocked. By default it stops once
-       10,000 unique websites are in hand (--target, counted before cleaning -
-       the final list is shorter; raise the target if you need more).
-    2. Drops rows with no website, Facebook/Yelp/Clutch-style pages, the wrong
-       trade, and repeats of a domain already kept.
-    3. "Mid-to-large": Maps does not publish headcount, so nothing is dropped
-       for size. Each agency's homepage is fetched once and scored on what a
-       bigger shop leaves lying around - a careers page, a hiring system
-       (Greenhouse, Lever ...), a team page, offices in other cities. The list
-       is sorted by that score and carries size_tier / size_signals columns, so
-       you filter in the sheet and can see why each one scored as it did.
-       It is a guess from public signals, not a headcount.
+    1. Google Maps caps one search at ~120 results, so "e-commerce company in
+       Salt Lake City" would return 120 of many thousands. Instead it runs 20 search
+       terms (online store, outdoor gear, apparel, supplements, skincare,
+       home goods, bedding, baby products ...) once per named area AND once per
+       ZIP code - about 2,200 small overlapping searches - and merges them. The
+       website is read straight off the result card - no place page is opened
+       - which is fast and rarely blocked. By default it stops once 10,000
+       unique websites are in hand (--target, counted before cleaning - the
+       final list is shorter; raise the target if you need more).
+    2. Drops rows with no website, marketplaces and social pages, national
+       chains (a known big-box name, or a domain with 5+ addresses on Maps),
+       trades that are never a brand (restaurants, salons, dentists ...) and
+       repeats of a domain already kept.
+    3. "DTC / e-commerce": Maps has no such category, so each homepage is
+       fetched once and checked for an online shop - a store platform
+       (Shopify, WooCommerce, BigCommerce, Magento ...) or cart / checkout /
+       product links. That goes in the sells_online column (yes / maybe / no /
+       unknown); rows with no shop are kept but sorted to the bottom, so you
+       filter them out in the sheet or check them by hand. Every row is also
+       scored on what a growing brand leaves lying around - a hiring system,
+       a careers page, "as seen in" press, a wholesale / stockist page, an
+       Amazon store, a mobile app, subscriptions, funding news - and sorted by
+       that score. A homepage that says the company acquires or holds a
+       portfolio of brands is flagged "aggregator?". All of this is a guess
+       from public signals, not revenue or headcount data.
 
 TIME
-    Full run: ~40 hours of searching at one tab (~20 h with --parallel 2), less
-    when --target stops it early. Leave it running; Ctrl+C and rerun any time.
-    --quick: 2 terms x 44 named areas = 88 searches, ~45 min, ~1,500 agencies.
+    Full run: ~19 hours of searching at one tab (~10 h with --parallel 2), less
+    when --target stops it early; then ~1-2 h reading homepages. Leave it
+    running; Ctrl+C and rerun any time.
+    --quick: 2 terms x 42 named areas = 84 searches, ~40 min.
 
 USEFUL OPTIONS
     --target 10000       stop once this many unique websites are collected
@@ -53,7 +61,7 @@ USEFUL OPTIONS
                          a Google block (it backs off and resumes by itself)
     --quick              first two search terms, named areas only (no ZIP codes)
     --rebuild            skip scraping; rebuild the list from the raw file
-    --no-size-check      skip step 3
+    --no-shop-check      skip step 3 (no sells_online column, no sorting)
     --headful            show the browser (use this if it reports a block)
     --queries "a;b"      your own search terms, semicolon-separated
     --locations "a;b"    your own areas, semicolon-separated
@@ -76,74 +84,87 @@ from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote_plus, urlsplit, urlunsplit
 
-# ---------------------------------------------------------------- what to search
+# ================================================================ REGION
+# Everything specific to this region sits between here and END REGION.
+# scrape_austin_dtc.py is the same file with a different block.
+
+REGION = "Salt Lake City"            # the city column in the output
+STATE = "Utah"
+OUT_NAME = "utah_ecommerce"          # file name stem; the output folder is <stem>_output
+AREA_CODES = {"801", "385", "435"}   # a local phone number is a small sign of a real local HQ
 
 QUERIES = [
-    "digital marketing agency",          # --quick runs the first two only
-    "advertising agency",
-    "marketing agency",
-    "SEO agency",
-    "social media marketing agency",
-    "branding agency",
-    "creative agency",
-    "web design agency",
-    "web development company",
-    "public relations agency",
-    "video production company",
-    "content marketing agency",
-    "influencer marketing agency",
-    "performance marketing agency",
-    "growth marketing agency",
-    "email marketing agency",
-    "PPC agency",
-    "media agency",
-    "design studio",
-    "ecommerce agency",
+    "e-commerce company",            # --quick runs the first two only
+    "online store",
+    "consumer products company",
+    "outdoor gear store",
+    "apparel brand",
+    "clothing boutique",
+    "supplement store",
+    "nutrition company",
+    "skincare brand",
+    "cosmetics store",
+    "home goods store",
+    "furniture store",
+    "bedding store",
+    "jewelry store",
+    "gift shop",
+    "toy store",
+    "specialty food store",
+    "pet store",
+    "sporting goods store",
+    "baby products store",
 ]
 
-# Neighbourhoods rather than "New York": each search is capped at ~120 cards,
-# so the only way to see the whole city is many small overlapping searches.
-_MANHATTAN = ["Financial District", "Tribeca", "SoHo", "Lower East Side", "East Village",
-              "West Village", "Greenwich Village", "Union Square", "Flatiron District",
-              "NoMad", "Chelsea", "Gramercy", "Murray Hill", "Garment District",
-              "Midtown", "Midtown East", "Times Square", "Hudson Yards",
-              "Hell's Kitchen", "Upper East Side", "Upper West Side", "Harlem"]
-_BROOKLYN = ["DUMBO", "Downtown Brooklyn", "Williamsburg", "Greenpoint", "Bushwick",
-             "Park Slope", "Gowanus", "Sunset Park", "Brooklyn Navy Yard"]
-_QUEENS = ["Long Island City", "Astoria", "Flushing", "Forest Hills", "Jamaica"]
-_METRO = ["Hoboken, NJ", "Jersey City, NJ", "Newark, NJ", "White Plains, NY", "Yonkers, NY",
-          "Garden City, NY", "Great Neck, NY", "Melville, NY"]
-NEIGHBOURHOODS = ([f"{n}, Manhattan, New York, NY" for n in _MANHATTAN]
-                  + [f"{n}, Brooklyn, NY" for n in _BROOKLYN]
-                  + [f"{n}, Queens, NY" for n in _QUEENS]
-                  + ["The Bronx, New York, NY", "Staten Island, New York, NY"] + _METRO)
-# ZIP codes tile the city far more finely than neighbourhood names - the
-# five boroughs have ~200 of them, and Maps accepts "agency in 10001, NY".
-# A few numbers in these ranges are not real ZIPs; Maps just returns nothing
-# for those, and the search is marked done.
-ZIPS = ([f"100{n:02d}" for n in range(1, 41) if n not in (8, 15)]                # Manhattan
-        + ["10044", "10065", "10069", "10075", "10128", "10280", "10282"]
-        + [f"112{n:02d}" for n in range(1, 40)] + ["11249", "11251", "11256"]      # Brooklyn
-        + [f"111{n:02d}" for n in range(1, 10)]                                    # LIC, Astoria
-        + [f"113{n:02d}" for n in range(51, 80)] + ["11385"]                       # Flushing ... Ridgewood
-        + [f"114{n:02d}" for n in range(11, 37)] + [f"116{n:02d}" for n in range(91, 98)]  # Jamaica, Rockaways
-        + [f"104{n:02d}" for n in range(51, 76)]                                   # The Bronx
-        + [f"103{n:02d}" for n in range(1, 15)])                                   # Staten Island
-LOCATIONS = NEIGHBOURHOODS + [f"{z}, NY" for z in ZIPS]
+# Areas rather than "Salt Lake City": each search is capped at ~120 cards, so
+# the only way to see the whole Wasatch Front is many small overlapping searches.
+_SLC = ["Downtown", "Sugar House", "The Avenues", "Central City", "Granary District",
+        "Ballpark", "Rose Park", "Glendale", "Poplar Grove", "Liberty Wells"]
+_VALLEY = ["Millcreek", "Murray", "Holladay", "Cottonwood Heights", "Midvale", "Sandy",
+           "Draper", "South Jordan", "West Jordan", "Riverton", "Herriman", "Bluffdale",
+           "Taylorsville", "West Valley City", "Park City"]
+_SLOPES = ["Lehi", "American Fork", "Pleasant Grove", "Lindon", "Orem", "Provo",
+           "Springville", "Spanish Fork", "Saratoga Springs", "Eagle Mountain", "Vineyard"]
+_NORTH = ["Ogden", "Layton", "Bountiful", "Farmington", "Logan", "St. George"]
+NEIGHBOURHOODS = ([f"{n}, Salt Lake City, UT" for n in _SLC]
+                  + [f"{n}, UT" for n in _VALLEY + _SLOPES + _NORTH])
+# ZIP codes tile the metro far more finely than area names, and Maps accepts
+# "online store in 84043, UT".
+ZIPS = ["84101", "84102", "84103", "84104", "84105", "84106", "84107", "84108", "84109",
+        "84111", "84112", "84113", "84115", "84116", "84117", "84118", "84119", "84120",
+        "84121", "84123", "84124", "84128", "84129",                                # Salt Lake City
+        "84047", "84070", "84092", "84093", "84094", "84020", "84095", "84009", "84081",
+        "84084", "84088", "84065", "84096", "84044", "84054", "84087",              # the valley
+        "84043", "84003", "84062", "84042", "84057", "84058", "84097", "84601", "84604",
+        "84606", "84663", "84660", "84045", "84005",                                # Silicon Slopes / Utah County
+        "84060", "84098", "84401", "84403", "84404", "84405", "84041", "84010", "84014",
+        "84015", "84025", "84037", "84067", "84075", "84321", "84770", "84790"]     # Park City, north, St. George
+LOCATIONS = NEIGHBOURHOODS + [f"{z}, UT" for z in ZIPS]
+# ================================================================ END REGION
 
-# A Maps category has to contain one of these to count as an agency. Maps pads
-# every search with neighbours - printers, recruiters, co-working spaces.
-# "software" is here on purpose: Maps files several real digital agencies
-# (Work & Co, Mint Digital) under "Software company", and losing a 400-person
-# agency costs more than letting the odd SaaS firm through.
-KEEP_CATEGORY = ["marketing", "advertis", "seo", "social media", "media",
-                 "brand", "digital", "design", "creative", "public relations",
-                 "e-commerce", "ecommerce", "video production", "software"]
-# ... or the business can say so in its own name, whatever Maps filed it under
-KEEP_NAME = re.compile(r"\b(agency|marketing|advertising|digital|media|creative|seo|"
-                       r"branding|design)\b", re.I)
-
-NYC_AREA_CODES = {"212", "332", "646", "917", "718", "347", "929"}
+# Maps pads every search with neighbours. A category containing one of these is
+# a trade that is never a consumer brand, so the row is dropped unless the
+# business calls itself a brand / shop / store in its own name.
+DROP_CATEGORY = [
+    "agency", "consultant", "marketing", "advertising", "web design", "restaurant", "cafe",
+    "coffee shop", "bar", "pub", "brewpub", "salon", "barber", "spa", "gym", "fitness",
+    "yoga", "dentist", "dental", "doctor", "physician", "medical", "clinic", "hospital",
+    "pharmacy", "lawyer", "attorney", "law firm", "real estate", "apartment", "property",
+    "school", "university", "college", "church", "insurance", "bank", "credit union",
+    "hotel", "motel", "repair", "contractor", "plumb", "electrician", "roofing", "hvac",
+    "car dealer", "used car", "auto", "gas station", "grocery", "supermarket", "government",
+    "storage", "moving", "cleaning", "landscap", "photographer", "wedding", "event venue",
+    "museum", "park", "thrift", "pawn", "convenience store", "shopping mall",
+    "department store", "printing", "sign shop", "coworking", "co-working", "recruit",
+    "staffing", "logistics", "freight", "warehouse", "fulfillment",
+    "accountant", "tax", "financial", "mortgage", "veterinar",
+    "child care", "day care", "tattoo", "laundry", "dry cleaner", "tutoring",
+]
+# ... unless the name says otherwise, whatever Maps filed it under
+KEEP_NAME = re.compile(r"\b(brand|brands|shop|store|boutique|co\.|goods|supply|apparel|"
+                       r"skincare|cosmetics|beauty|supplements?|nutrition|coffee|candles?|"
+                       r"jewelry|leather|boots?|outfitters|provisions|foods?)\b", re.I)
+CHAIN_LOCATIONS = 5                  # a domain with this many addresses on Maps is a chain
 
 # ---------------------------------------------------------------- maps scraping
 
@@ -159,15 +180,17 @@ HOURS_RE = re.compile(r"^(open|clos|temporarily|permanently|24\s*hours|opens|reo
 # Card chrome, not business data
 NOISE_LINES = {"no reviews", "no rating", "new", "sponsored", "website", "directions",
                "online estimates", "on-site services", "online appointments",
-               "in-store shopping", "in-store pick-up", "delivery",
-               "wheelchair accessible entrance", "identifies as women-owned",
-               "call", "share", "save", "book online", "order online"}
+               "in-store shopping", "in-store pick-up", "in-store pickup", "delivery",
+               "curbside pickup", "wheelchair accessible entrance",
+               "identifies as women-owned", "identifies as veteran-owned",
+               "identifies as latino-owned", "identifies as black-owned",
+               "call", "share", "save", "book online", "order online", "shop online"}
 
 
 # Google salts card text with icon glyphs from the Unicode Private Use Area
 # (U+E000-U+F8FF). They carry no meaning and wreck naive text parsing.
 def _clean(text: str) -> str:
-    return "".join(ch for ch in text if not ("\ue000" <= ch <= "\uf8ff")).strip()
+    return "".join(ch for ch in text if not ("" <= ch <= "")).strip()
 
 
 # Pulls every card out of the feed in one evaluate - one round trip per scroll
@@ -407,14 +430,43 @@ async def scrape_all(searches: list[str], raw_path: str, per_search: int, headfu
 # Whole domains, never substrings. A substring test looks harmless until it
 # throws away terminix.com for containing "x.com".
 BAD_DOMAINS = {
+    # social / directories / link pages
     "facebook.com", "fb.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
     "youtube.com", "tiktok.com", "pinterest.com", "whatsapp.com", "wa.me", "yelp.com",
     "bbb.org", "yellowpages.com", "thumbtack.com", "nextdoor.com", "google.com",
-    "goo.gl", "business.site", "linktr.ee", "clutch.co", "upcity.com", "sortlist.com",
-    "designrush.com", "goodfirms.co", "agencyspotter.com", "behance.net", "dribbble.com",
-    "fiverr.com", "upwork.com", "calendly.com",
+    "goo.gl", "business.site", "linktr.ee", "behance.net", "calendly.com",
+    # marketplaces - a brand's Amazon or Etsy page is not its own site
+    "amazon.com", "etsy.com", "ebay.com", "walmart.com", "target.com", "faire.com",
+    "poshmark.com", "mercari.com", "doordash.com", "ubereats.com", "grubhub.com",
+    "instacart.com", "shopify.com", "wix.com", "squarespace.com",
+}
+# National chains and big-box retailers: they sell online, they hire, they have
+# press - they would score top of the list and are not the target.
+CHAIN_DOMAINS = {
+    "costco.com", "bestbuy.com", "homedepot.com", "lowes.com", "kohls.com", "macys.com",
+    "nordstrom.com", "nordstromrack.com", "tjx.com", "tjmaxx.tjx.com", "marshalls.com",
+    "rossstores.com", "dollartree.com", "dollargeneral.com", "walgreens.com", "cvs.com",
+    "heb.com", "wholefoodsmarket.com", "traderjoes.com", "samsclub.com", "michaels.com",
+    "hobbylobby.com", "dickssportinggoods.com", "academy.com", "rei.com", "ulta.com",
+    "sephora.com", "gap.com", "oldnavy.com", "bananarepublic.com", "nike.com", "adidas.com",
+    "lululemon.com", "apple.com", "ikea.com", "petsmart.com", "petco.com", "staples.com",
+    "officedepot.com", "barnesandnoble.com", "gamestop.com", "cabelas.com", "basspro.com",
+    "tractorsupply.com", "autozone.com", "oreillyauto.com", "7-eleven.com", "cvs.com",
+    "bedbathandbeyond.com", "worldmarket.com", "crateandbarrel.com", "potterybarn.com",
+    "williams-sonoma.com", "westelm.com", "ashleyfurniture.com", "roomstogo.com",
+    "mattressfirm.com", "sleepnumber.com", "verizon.com", "att.com", "t-mobile.com",
+    "sprint.com", "xfinity.com", "kroger.com", "randalls.com", "albertsons.com",
+    "sprouts.com", "naturalgrocers.com", "gnc.com", "vitaminshoppe.com", "zales.com",
+    "kay.com", "jared.com", "pandora.net", "bathandbodyworks.com", "victoriassecret.com",
+    "footlocker.com", "finishline.com", "journeys.com", "hm.com", "zara.com", "uniqlo.com",
+    "forever21.com", "americaneagle.com", "hollisterco.com", "abercrombie.com", "jcrew.com",
+    "anthropologie.com", "urbanoutfitters.com", "freepeople.com", "madewell.com",
+    "sherwin-williams.com", "harborfreight.com", "acehardware.com", "wayfair.com",
+    "smithsfoodanddrug.com", "harmonsgrocery.com", "maceys.com", "winco.com", "deseretbook.com",
 }
 TRACKING = re.compile(r"^(utm_|gclid|fbclid|msclkid|mc_|ref|source|y_source)", re.I)
+# stores.brand.com / locations.brand.com is a store finder, not a second company
+LOCATOR_PREFIXES = {"www", "stores", "store", "locations", "location", "local", "shop", "shops"}
 
 
 def host_of(url: str) -> str:
@@ -422,12 +474,19 @@ def host_of(url: str) -> str:
         h = urlsplit(url).netloc.split("@")[-1].split(":")[0].lower()
     except ValueError:
         return ""
-    return h[4:] if h.startswith("www.") else h
+    parts = h.split(".")
+    while len(parts) > 2 and parts[0] in LOCATOR_PREFIXES:
+        parts = parts[1:]
+    return ".".join(parts)
 
 
 def is_bad_host(host: str) -> bool:
-    """True for a directory or social page rather than a company's own site."""
+    """True for a marketplace, directory or social page rather than the brand's own site."""
     return any(host == d or host.endswith("." + d) for d in BAD_DOMAINS)
+
+
+def is_chain_host(host: str) -> bool:
+    return any(host == d or host.endswith("." + d) for d in CHAIN_DOMAINS)
 
 
 def clean_url(raw: str) -> str:
@@ -443,20 +502,30 @@ def clean_url(raw: str) -> str:
         return ""
     if not parts.netloc or "." not in parts.netloc:
         return ""
+    host = parts.netloc.lower()
+    # A store-finder page (stores.brand.com/tx/austin/...) is not the site to
+    # contact - the brand's own root is.
+    if host.split(".")[0] in LOCATOR_PREFIXES - {"www", "shop", "shops"} \
+            or re.search(r"/(stores?|locations?|store-locator|find-a-store)\b", parts.path, re.I):
+        return urlunsplit(("https", host_of(raw), "/", "", ""))
     keep = [kv for kv in parts.query.split("&")
             if kv and not TRACKING.match(kv.split("=")[0])]
     return urlunsplit(("https", parts.netloc, parts.path.rstrip("/") or "/", "&".join(keep), ""))
 
 
 def build_list(raw_rows: list[dict]) -> tuple[list[dict], list[dict], Counter]:
-    """raw cards -> (one row per agency, rejects with reasons, reject tally)."""
-    # How many different searches surfaced each site. An agency Maps shows for
-    # six neighbourhoods and three search terms is a more established one.
+    """raw cards -> (one row per brand, rejects with reasons, reject tally)."""
+    # How many different searches surfaced each site, and how many distinct
+    # addresses it has - a brand with a dozen storefronts across the metro is a
+    # chain, whatever it is called.
     seen_in: dict[str, set] = {}
+    addresses: dict[str, set] = {}
     for r in raw_rows:
         h = host_of(clean_url(r.get("website", "")))
         if h:
             seen_in.setdefault(h, set()).add(r.get("query", ""))
+            if r.get("address"):
+                addresses.setdefault(h, set()).add(r["address"].lower())
 
     kept: "OrderedDict[str, dict]" = OrderedDict()
     rejects, tally = [], Counter()
@@ -476,39 +545,79 @@ def build_list(raw_rows: list[dict]) -> tuple[list[dict], list[dict], Counter]:
             drop(r, "no website on Maps", name); continue
         host = host_of(url)
         if host in kept:
-            continue                     # same agency, seen in another search
+            continue                     # same brand, seen in another search
         if is_bad_host(host):
-            drop(r, "social or directory page, not the agency's own site", host); continue
+            drop(r, "marketplace, social or directory page, not the brand's own site", host); continue
+        if is_chain_host(host):
+            drop(r, "national chain or big-box retailer", host); continue
+        n_loc = len(addresses.get(host, ()))
+        if n_loc >= CHAIN_LOCATIONS:
+            drop(r, f"chain or franchise ({n_loc} addresses on Maps) - rescue by hand if it is a local brand", host); continue
         cat = r.get("category", "")
-        if not any(k in cat.lower() for k in KEEP_CATEGORY) and not KEEP_NAME.search(name):
-            drop(r, f"not an agency category ({cat or 'blank'})", host); continue
+        if any(k in cat.lower() for k in DROP_CATEGORY) and not KEEP_NAME.search(name):
+            drop(r, f"not a brand or shop category ({cat or 'blank'})", host); continue
         digits = re.sub(r"\D", "", r.get("phone", ""))[-10:]
         kept[host] = {
-            "website": url, "company_name": name, "city": "New York", "country": "USA",
+            "website": url, "company_name": name, "city": REGION, "state": STATE, "country": "USA",
             "area": r.get("location", "").split(",")[0], "address": r.get("address", ""),
             "phone": r.get("phone", ""),
-            "nyc_phone": ("yes" if digits[:3] in NYC_AREA_CODES else "no") if len(digits) == 10 else "",
+            "local_phone": ("yes" if digits[:3] in AREA_CODES else "no") if len(digits) == 10 else "",
             "category": cat, "rating": r.get("rating", ""), "reviews": r.get("reviews", ""),
-            "searches_seen_in": len(seen_in.get(host, ())),
-            "size_tier": "", "size_score": "", "size_signals": "",
+            "searches_seen_in": len(seen_in.get(host, ())), "locations_on_maps": n_loc,
+            "sells_online": "", "platform": "", "aggregator": "",
+            "growth_tier": "", "growth_score": "", "signals": "",
         }
     return list(kept.values()), rejects, tally
 
-# ---------------------------------------------------------------- size check
+# ---------------------------------------------------------------- shop check
+
+# The store platform is the surest sign a site sells online: every Shopify
+# theme loads from cdn.shopify.com, every WooCommerce site ships its plugin
+# name, and so on. A custom-built shop is caught by the cart / product links.
+PLATFORMS = [
+    ("Shopify", re.compile(r"cdn\.shopify\.com|myshopify\.com|Shopify\.theme|shopify-section", re.I)),
+    ("WooCommerce", re.compile(r"woocommerce", re.I)),
+    ("BigCommerce", re.compile(r"bigcommerce\.com", re.I)),
+    ("Magento", re.compile(r"/static/(?:version\d+/)?frontend/|Magento_|/mage/", re.I)),
+    ("Salesforce Commerce Cloud", re.compile(r"demandware\.(?:static|net)", re.I)),
+    ("Wix Stores", re.compile(r"wixstores|wix-ecommerce|ecom\.wix", re.I)),
+    ("Squarespace Commerce", re.compile(r"sqs-cart|squarespace-commerce|Squarespace\.Commerce", re.I)),
+    ("Webflow Ecommerce", re.compile(r"w-commerce", re.I)),
+    ("Shopware", re.compile(r"shopware", re.I)),
+    ("PrestaShop", re.compile(r"prestashop", re.I)),
+    ("Squarespace / Wix / Webflow shop", re.compile(r"\"@type\"\s*:\s*\"Product\"", re.I)),
+]
+CART_SIGNALS = [
+    ("add-to-cart button", re.compile(r"add[\s-]+to[\s-]+(?:cart|bag|basket)", re.I)),
+    ("cart / checkout link", re.compile(r"""href\s*=\s*["'][^"']*/(?:cart|checkout|bag)\b""", re.I)),
+    ("product pages", re.compile(r"""href\s*=\s*["'][^"']*/(?:collections|products|product|shop)/""", re.I)),
+    ("shop now", re.compile(r"shop\s+(?:now|all)\b", re.I)),
+    ("free shipping", re.compile(r"free\s+shipping", re.I)),
+]
 
 HIRING_SYSTEMS = re.compile(r"greenhouse\.io|lever\.co|workable\.com|bamboohr\.com|ashbyhq\.com|"
                             r"smartrecruiters\.com|jobvite\.com|icims\.com|recruitee\.com|"
                             r"breezy\.hr|applytojob\.com|teamtailor\.com|rippling\.com/jobs|"
-                            r"workdayjobs\.com|paylocity\.com/recruiting", re.I)
+                            r"workdayjobs\.com|paylocity\.com/recruiting|gusto\.com/job", re.I)
 _HREF = r"""href\s*=\s*["'][^"']*(?:%s)"""
 CAREERS_LINK = re.compile(_HREF % r"career|/jobs|join-us|join-our-team|work-with-us|work-for-us|"
                                   r"hiring|open-positions|openings|opportunities", re.I)
-TEAM_LINK = re.compile(_HREF % r"our-team|/team|leadership|/people|who-we-are|our-people", re.I)
-WORK_LINK = re.compile(_HREF % r"case-stud|/work|our-work|/clients|portfolio|success-stor", re.I)
-OTHER_OFFICES = ["london", "los angeles", "chicago", "san francisco", "miami", "toronto",
-                 "boston", "austin", "dallas", "atlanta", "seattle", "denver", "singapore",
-                 "sydney", "dubai", "berlin", "paris", "amsterdam", "washington", "philadelphia",
-                 "hong kong", "tokyo", "mumbai", "são paulo", "sao paulo", "mexico city"]
+PRESS = re.compile(r"as\s+seen\s+(?:in|on)|featured\s+in|in\s+the\s+press|/press\b|press\s+kit", re.I)
+WHOLESALE = re.compile(r"wholesale|stockists?|store\s+locator|find\s+(?:a|in)\s+store|"
+                       r"where\s+to\s+buy|retail\s+partners|find\s+us\s+in\s+stores", re.I)
+AMAZON_STORE = re.compile(r"amazon\.com/(?:stores/|shops/|s\?me=|[^\"'\s]*?/dp/)", re.I)
+APP_LINK = re.compile(r"apps\.apple\.com|play\.google\.com/store", re.I)
+SUBSCRIPTION = re.compile(r"subscribe\s*(?:&|and)\s*save|\bsubscriptions?\b|rechargepayments|"
+                          r"skio|loop\s*subscriptions", re.I)
+GROWTH_WORDS = re.compile(r"series\s+[abc]\b|raised\s+\$|inc\.?\s*5000|fastest[\s-]growing|"
+                          r"now\s+hiring|we'?re\s+hiring", re.I)
+AGGREGATOR = re.compile(r"brand\s+aggregator|acquir(?:e|es|ed|ing)\s+(?:amazon\s+|fba\s+|e-?commerce\s+|"
+                        r"dtc\s+|consumer\s+|leading\s+|top\s+|and\s+grow\s+)?brands|portfolio\s+of\s+(?:\d+\s+)?"
+                        r"(?:consumer\s+|dtc\s+|e-?commerce\s+|amazon\s+)?brands|fba\s+brands|"
+                        r"(?:sell|buy)\s+your\s+(?:amazon|fba|e-?commerce|shopify)\s+(?:business|brand|store)|"
+                        r"amazon'?s\s+top\s+\d+\s+sellers|top\s+(?:amazon|fba)\s+sellers?|"
+                        r"(?:house|family|portfolio)\s+of\s+brands|explore\s+our\s+brands|brands\s+we(?:'ve|\s+have)\s+acquired",
+                        re.I)
 
 # Reading public homepages for a few keywords: a broken certificate chain (very
 # common on a fresh python.org install on a Mac) should not cost us the site.
@@ -584,30 +693,54 @@ async def fetch_with_browser(urls: list[str]) -> dict[str, tuple[str, str]]:
     return out
 
 
-def score_html(html: str) -> tuple[int, str]:
-    """(score, signals) from a homepage."""
+def check_shop(html: str) -> dict:
+    """What a homepage says about selling online and about the size of the brand."""
     text = re.sub(r"(?is)<(script|style)\b.*?</\1>|<[^>]+>", " ", html).lower()
+    platform = next((name for name, rx in PLATFORMS if rx.search(html)), "")
+    cart = [name for name, rx in CART_SIGNALS if rx.search(html)]
+    if platform:
+        sells = "yes"
+    elif len(cart) >= 2:
+        sells = "yes"
+    elif cart:
+        sells = "maybe"
+    else:
+        sells = "no"
+
     score, signals = 0, []
+    if platform:
+        signals.append(f"shop on {platform}")
+    elif cart:
+        signals.append("shop signals: " + ", ".join(cart))
     if HIRING_SYSTEMS.search(html):
         score += 3; signals.append("uses a hiring system")
     if CAREERS_LINK.search(html):
         score += 2; signals.append("careers page")
-    offices = [c for c in OTHER_OFFICES if re.search(rf"\b{re.escape(c)}\b", text)]
-    if len(offices) >= 2:
-        score += 2; signals.append("other cities named: " + ", ".join(offices[:4]))
-    if TEAM_LINK.search(html):
-        score += 1; signals.append("team page")
-    if WORK_LINK.search(html):
-        score += 1; signals.append("case studies / clients page")
-    return score, "; ".join(signals)
+    if PRESS.search(html):
+        score += 1; signals.append("press / as seen in")
+    if WHOLESALE.search(text):
+        score += 1; signals.append("wholesale / stockists")
+    if AMAZON_STORE.search(html):
+        score += 1; signals.append("Amazon store")
+    if APP_LINK.search(html):
+        score += 1; signals.append("mobile app")
+    if SUBSCRIPTION.search(html):
+        score += 1; signals.append("subscriptions")
+    if GROWTH_WORDS.search(text):
+        score += 1; signals.append("hiring / funding / growth wording")
+    aggregator = "aggregator?" if AGGREGATOR.search(text) else ""
+    if aggregator:
+        signals.append("says it acquires or holds a portfolio of brands")
+    return {"sells_online": sells, "platform": platform, "score": score,
+            "signals": "; ".join(signals), "aggregator": aggregator}
 
 
-def add_sizes(rows: list[dict], cache: dict[str, dict]) -> None:
+def add_shop_info(rows: list[dict], cache: dict[str, dict]) -> None:
     todo = [r["website"] for r in rows if r["website"] not in cache]
     if todo:
-        print(f"size check: reading {len(todo)} homepages ...")
+        print(f"shop check: reading {len(todo)} homepages ...")
     pages: dict[str, tuple[str, str]] = {}
-    with ThreadPoolExecutor(max_workers=12) as pool:
+    with ThreadPoolExecutor(max_workers=24) as pool:
         for n, (url, got) in enumerate(zip(todo, pool.map(fetch_plain, todo)), 1):
             pages[url] = got
             if n % 100 == 0:
@@ -625,16 +758,18 @@ def add_sizes(rows: list[dict], cache: dict[str, dict]) -> None:
     for url in todo:
         html, why = pages[url]
         if html:
-            score, signals = score_html(html)
-            cache[url] = {"score": score, "signals": signals}
+            cache[url] = check_shop(html)
         elif why == DEAD:
-            cache[url] = {"score": -2, "signals": DEAD}
+            cache[url] = {"sells_online": "unknown", "platform": "", "score": -2,
+                          "signals": DEAD, "aggregator": ""}
         elif why in ("HTTP 401", "HTTP 403", "HTTP 418", "HTTP 422", "HTTP 429", "HTTP 503"):
             # A firewall - which is itself a sign of a bigger shop
-            cache[url] = {"score": -1, "signals": f"site turns away automated visitors "
-                                                  f"({why}) - check by hand"}
+            cache[url] = {"sells_online": "unknown", "platform": "", "score": -1,
+                          "signals": f"site turns away automated visitors ({why}) - check by hand",
+                          "aggregator": ""}
         else:
-            cache[url] = {"score": -1, "signals": f"site did not load ({why}) - check by hand"}
+            cache[url] = {"sells_online": "unknown", "platform": "", "score": -1,
+                          "signals": f"site did not load ({why}) - check by hand", "aggregator": ""}
 
     # "Shown in many searches" has to be relative: a full run is thousands of searches
     # and almost everyone clears any fixed bar. Top quarter, and never below 4.
@@ -651,14 +786,20 @@ def add_sizes(rows: list[dict], cache: dict[str, dict]) -> None:
             if int(r["searches_seen_in"]) >= often:
                 score += 1; signals = (signals + "; " if signals else "") + \
                     f"shown in {often}+ searches (top quarter)"
-        r["size_score"] = score if score >= 0 else ""
-        r["size_signals"] = signals
-        r["size_tier"] = ("dead site" if score == -2 else "unknown" if score < 0
-                          else "likely mid-large" if score >= 5
-                          else "possible" if score >= 3 else "likely small")
-    # unknowns sit between "possible" and "likely small"; dead sites go last
-    order = {"unknown": 2.5, "dead site": -1}
-    rows.sort(key=lambda r: -order.get(r["size_tier"], r["size_score"] or 0))
+        r["sells_online"] = c["sells_online"]
+        r["platform"] = c["platform"]
+        r["aggregator"] = c["aggregator"]
+        r["growth_score"] = score if score >= 0 else ""
+        r["signals"] = signals
+        r["growth_tier"] = ("dead site" if score == -2 else "unknown" if score < 0
+                            else "strong signals" if score >= 5
+                            else "some signals" if score >= 2 else "few signals")
+    # Shops first, then the strength of the growth signals; sites with no shop
+    # found sit at the bottom, dead sites last of all.
+    sells = {"yes": 0, "maybe": 1, "unknown": 2, "no": 3}
+    order = {"strong signals": 3, "some signals": 2, "unknown": 1.5, "few signals": 1, "dead site": 0}
+    rows.sort(key=lambda r: (r["growth_tier"] == "dead site", sells[r["sells_online"]],
+                             -order[r["growth_tier"]], -(r["growth_score"] or 0)))
 
 # ---------------------------------------------------------------- output
 
@@ -673,7 +814,7 @@ def write_xlsx_parts(out_dir: str, stem: str, rows: list[dict], fields: list[str
             os.remove(os.path.join(out_dir, f))
     chunks = [rows[i:i + size] for i in range(0, len(rows), size)] or [[]]
     for n, chunk in enumerate(chunks, 1):
-        wb = Workbook(); ws = wb.active; ws.title = "Agencies"
+        wb = Workbook(); ws = wb.active; ws.title = "Brands"
         ws.append(fields)
         for r in chunk:
             ws.append([r.get(k, "") for k in fields])
@@ -684,12 +825,12 @@ def write_xlsx_parts(out_dir: str, stem: str, rows: list[dict], fields: list[str
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out-dir", default=os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "nyc_agencies_output"))
-    ap.add_argument("--name", default="nyc_agencies", help="file name stem for the outputs")
+        os.path.dirname(os.path.abspath(__file__)), OUT_NAME + "_output"))
+    ap.add_argument("--name", default=OUT_NAME, help="file name stem for the outputs")
     ap.add_argument("--quick", action="store_true",
                     help="first two search terms, named areas only (no ZIP codes)")
     ap.add_argument("--queries", help="semicolon-separated search terms")
-    ap.add_argument("--locations", help="semicolon-separated areas, e.g. 'Downtown, Austin, TX'")
+    ap.add_argument("--locations", help="semicolon-separated areas, e.g. 'Lehi, UT'")
     ap.add_argument("--per-search", type=int, default=200,
                     help="Maps caps a search near 120; the default means 'everything'")
     ap.add_argument("--target", type=int, default=10000,
@@ -697,7 +838,7 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, default=1,
                     help="browser tabs searching at once; 2 halves the time, raises the block risk")
     ap.add_argument("--rebuild", action="store_true", help="no scraping, rebuild from the raw file")
-    ap.add_argument("--no-size-check", action="store_true")
+    ap.add_argument("--no-shop-check", action="store_true")
     ap.add_argument("--headful", action="store_true", help="show the browser window")
     args = ap.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
@@ -706,10 +847,10 @@ def main() -> int:
     queries = [q.strip() for q in (args.queries or "").split(";") if q.strip()] or QUERIES
     if args.quick:
         queries = queries[:2]
-    # Semicolons, not commas: an area is written "SoHo, Manhattan, New York, NY"
+    # Semicolons, not commas: an area is written "Sugar House, Salt Lake City, UT"
     locations = [l.strip() for l in (args.locations or "").split(";") if l.strip()] \
         or (NEIGHBOURHOODS if args.quick else LOCATIONS)
-    # Term-major order: the main term covers the whole city before the second
+    # Term-major order: the main term covers the whole metro before the second
     # term starts, so stopping early still leaves a complete list for term one.
     searches = [f"{q} in {loc}" for q in queries for loc in locations]
 
@@ -739,30 +880,37 @@ def main() -> int:
         print("nothing scraped yet"); return 1
     rows, rejects, tally = build_list(raw)
 
-    if not args.no_size_check:
-        cache = {r["website"]: {"score": r["size_score"], "signals": r["size_signals"]}
-                 for r in read_csv(path("_sizecache.csv"))}
+    if not args.no_shop_check:
+        cache = {r["website"]: {"sells_online": r["sells_online"], "platform": r["platform"],
+                                "score": r["score"], "signals": r["signals"],
+                                "aggregator": r["aggregator"]}
+                 for r in read_csv(path("_shopcache.csv"))}
         try:
-            add_sizes(rows, cache)
+            add_shop_info(rows, cache)
         finally:                         # a rebuild must not re-fetch 2,000 homepages
-            write_csv(path("_sizecache.csv"),
-                      [{"website": w, "size_score": c["score"], "size_signals": c["signals"]}
-                       for w, c in cache.items()],
-                      ["website", "size_score", "size_signals"])
+            write_csv(path("_shopcache.csv"),
+                      [{"website": w, **c} for w, c in cache.items()],
+                      ["website", "sells_online", "platform", "score", "signals", "aggregator"])
 
     fields = list(rows[0]) if rows else ["website"]
-    if args.no_size_check:
-        fields = [f for f in fields if not f.startswith("size_")]
+    if args.no_shop_check:
+        fields = [f for f in fields if f not in ("sells_online", "platform", "aggregator",
+                                                 "growth_tier", "growth_score", "signals")]
     write_csv(path(".csv"), rows, fields)
     write_csv(path("_rejects.csv"), rejects, RAW_FIELDS + ["dropped_because"])
     parts = write_xlsx_parts(args.out_dir, args.name, rows, fields)
 
-    print(f"\n{len(raw)} cards scraped -> {len(rows)} agencies with their own website")
+    print(f"\n{len(raw)} cards scraped -> {len(rows)} companies with their own website")
     for why, n in tally.most_common():
         print(f"  dropped {n:>5}  {why}")
-    if not args.no_size_check:
-        for tier, n in Counter(r["size_tier"] for r in rows).most_common():
+    if not args.no_shop_check:
+        for sells, n in Counter(r["sells_online"] for r in rows).most_common():
+            print(f"  {n:>5}  sells online: {sells}")
+        for tier, n in Counter(r["growth_tier"] for r in rows).most_common():
             print(f"  {n:>5}  {tier}")
+        agg = sum(1 for r in rows if r["aggregator"])
+        if agg:
+            print(f"  {agg:>5}  flagged aggregator?")
     print(f"\nlist     {path('.csv')}" + (f"   (+ {parts} xlsx part(s))" if parts else ""))
     print(f"rejects  {path('_rejects.csv')}")
     return 0
