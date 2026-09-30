@@ -8,6 +8,11 @@
 Per website:
     homepage -> find contact page -> find contact form
         form found and no CAPTCHA  -> fill, screenshot, submit, screenshot, verify
+        form found, CAPTCHA        -> recorded as needs_human and left for --assist
+    python run.py --input leads.xlsx --live --assist
+        only the needs_human rows, one at a time, in a visible browser: the form
+        is filled, then a person ticks the box / solves the CAPTCHA and presses
+        Submit; the result is verified and recorded like any other submission
         otherwise                  -> scrape/fall back to an email address and send
     every outcome is screenshotted and written to output/results.xlsx
 """
@@ -366,11 +371,26 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
 
     top_score, top_form, top_frame = (ranked[0] if ranked else (-999, None, None))
     captcha = await discovery.has_captcha(page, top_frame)
+    assist = bool(getattr(args, "assist", False))
 
     use_form = top_form is not None and top_score >= 40
     if use_form and captcha and cfg.path("form", "skip_if_captcha", default=True):
-        use_form = False
-        result["detail"] = f"CAPTCHA present ({captcha}) - falling back to email. "
+        if assist:
+            result["detail"] = f"CAPTCHA present ({captcha}) - left for the person at the browser. "
+        elif cfg.path("email", "enabled", default=True):
+            use_form = False
+            result["detail"] = f"CAPTCHA present ({captcha}) - falling back to email. "
+        else:
+            # Nothing automatic can be done with this form, and email is off.
+            # Rather than "skipped", keep it: an assisted run opens it in a
+            # visible browser with every field filled, and a person does the
+            # one thing the site reserves for people.
+            result.update(method="form", status="needs_human",
+                          detail=(f"CAPTCHA present ({captcha}) - queued for assisted "
+                                  "submission: a person solves it in an open tab"))
+            result["screenshot_before"] = await ev.shot(page, idx, url, "01_page")
+            await page.close()
+            return result
 
     # A form with nowhere to put the message can only deliver a name and an
     # email address - the recipient gets an enquiry that says nothing. The
@@ -421,6 +441,42 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
         if not cfg.live:
             result["status"] = "dry_run"
             result["detail"] += f"filled {report['roles']} - not submitted (dry run)"
+            return True
+
+        if assist:
+            # Everything the agent can fill is filled. Now the person at the
+            # browser does the rest - the box, the CAPTCHA, the Submit - and
+            # the page is watched for the same evidence an automatic submit
+            # is judged on.
+            wait_s = float(cfg.path("form", "assist_wait_s", default=240))
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            log(f"    HUMAN: form filled in the open tab - tick the box / solve the "
+                f"CAPTCHA and press Submit (waiting up to {wait_s:.0f}s)", logfile)
+            before_url = page.url
+            before_body = await filler.read_context_body(page, frame)
+            await arm_submit_watch(frame if frame is not None else page, form["form_key"])
+            verdict = await wait_for_human(page, frame, form["form_key"], before_url,
+                                           before_body, wait_s)
+            if not page.is_closed():
+                result["screenshot_after"] = await ev.shot(page, idx, url, "02_after_submit")
+            if verdict is None:
+                result["status"] = "needs_human"
+                result["detail"] += f"not submitted within {wait_s:.0f}s - still queued"
+            else:
+                status, detail, _strength = verdict
+                result["status"] = status
+                result["detail"] += f"human-assisted; {detail}"
+            return True
+
+        if report.get("human_checks") and not cfg.path("email", "enabled", default=True):
+            # A plain "I am not a robot" box is the site's bot check, and it
+            # is not the agent's to tick. Same treatment as a CAPTCHA.
+            result["status"] = "needs_human"
+            result["detail"] += (f"bot-check box {report['human_checks']} - queued for "
+                                 "assisted submission: a person ticks it in an open tab")
             return True
 
         if rejected:
@@ -544,6 +600,83 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     return result
 
 
+SUBMIT_WATCH_JS = """(key) => {
+    window.__agentSubmitted = false;
+    const f = document.querySelector(`form[data-agent-form='${key}']`);
+    if (!f) return false;
+    const mark = () => { window.__agentSubmitted = true; };
+    f.addEventListener('submit', mark, true);
+    f.querySelectorAll("button, input[type=submit], input[type=image], [role=button]")
+        .forEach(b => b.addEventListener('click', mark, true));
+    return true;
+}"""
+
+
+async def arm_submit_watch(scope, form_key: str) -> None:
+    """Plant the flag wait_for_human looks for: the person's own Submit."""
+    try:
+        await scope.evaluate(SUBMIT_WATCH_JS, form_key)
+    except Exception:
+        pass
+
+
+async def wait_for_human(page, frame, form_key: str, before_url: str, before_body: str,
+                         wait_s: float):
+    """Watch a form a person is finishing by hand.
+
+    Returns verify_submission's (status, detail, strength) once their
+    submission has landed, or None if it never did within wait_s.
+
+    The judgement is anchored on the person's click, never on the page alone:
+    a marquee that rolled "Thank you!" into view scored nantum.ai a success
+    with nobody at the keyboard. So the page is only read once the flag
+    arm_submit_watch planted has fired - or the URL has landed on a thank-you
+    page, which no idle page does by itself. A validation error after their
+    click is not the end either; they fix it and click again.
+    """
+    end = time.monotonic() + wait_s
+    scope = frame if frame is not None else page
+    while time.monotonic() < end:
+        await asyncio.sleep(2)
+        if page.is_closed():
+            return "needs_human", "the tab was closed before the form was submitted", "strong"
+        try:
+            url = page.url
+            landed = url != before_url and re.search(r"thank|success|sent|submitted", url, re.I)
+            clicked = False
+            if not landed:
+                clicked = bool(await scope.evaluate("() => !!window.__agentSubmitted"))
+        except Exception:
+            if page.is_closed():
+                return "needs_human", "the tab was closed before the form was submitted", "strong"
+            # The page is navigating or the frame was torn down. Only a
+            # thank-you URL counts by itself; otherwise keep watching.
+            continue
+        if not (landed or clicked):
+            continue
+        try:
+            verdict = await filler.verify_submission(page, frame, before_url, form_key, before_body)
+        except Exception as exc:  # noqa: BLE001
+            if page.is_closed():
+                return "needs_human", "the tab was closed before the form was submitted", "strong"
+            verdict = ("uncertain", f"submitted, but the page could not be read afterwards "
+                                    f"({type(exc).__name__})", "weak")
+        if verdict[0] in ("success", "uncertain"):
+            return verdict
+        # Their click was refused (a field the site wanted, the CAPTCHA not
+        # yet solved). Re-arm and let them try again.
+        try:
+            before_url = page.url
+            before_body = await filler.read_context_body(page, frame)
+            await arm_submit_watch(scope, form_key)
+        except Exception:
+            pass
+    # Out of time with no confirmed submission. Whatever the page looked like
+    # in between - a stray "required" in the footer reads as a validation error
+    # - nothing was sent, so the site stays queued rather than becoming a fail.
+    return None
+
+
 class RunLock:
     """A pid file for the duration of a run, so other processes can see it.
 
@@ -597,7 +730,7 @@ async def main_async(args) -> int:
     cfg = Config.load(args.config)
     if args.live:
         cfg["run"]["mode"] = "live"
-    if args.no_headless:
+    if args.no_headless or getattr(args, "assist", False):
         cfg["run"]["headless"] = False
 
     logfile = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log"))
@@ -753,7 +886,16 @@ async def main_async(args) -> int:
     carried_over = 0
     run_started = datetime.now()
 
-    if getattr(args, "continue_batch", False):
+    if getattr(args, "assist", False):
+        # Only the rows a person has to finish. Everything else in the sheet
+        # was already handled, or will be, by the automatic run.
+        pending = [r for r in rows
+                   if (state.get(r["website"]) or {}).get("status") == "needs_human"]
+        log(f"assisted run: {len(pending)} site(s) queued for a person to submit "
+            f"({len(rows) - len(pending)} other rows left alone)", logfile)
+        carried_over = len(rows) - len(pending)
+        rows = pending
+    elif getattr(args, "continue_batch", False):
         # Picking up a batch that stopped: anything with a record was already
         # visited, whatever the outcome, so start from the first row that has
         # none. Matched on the normalised host so a www/https difference in the
@@ -809,6 +951,10 @@ async def main_async(args) -> int:
     results: list[dict] = []
     daily_cap = int(cfg.path("email", "daily_limit", default=50))
     site_timeout = float(cfg.path("run", "site_timeout_s", default=180))
+    if getattr(args, "assist", False):
+        # The per-site ceiling must outlast the person, not just the page.
+        site_timeout = max(site_timeout,
+                           float(cfg.path("form", "assist_wait_s", default=240)) + 90)
     today = datetime.now().date().isoformat()
     report_path = cfg.resolve(cfg.path("paths", "report_path", default="output/report.html"))
     report_mode = "live" if cfg.live else "dry_run"
@@ -837,6 +983,8 @@ async def main_async(args) -> int:
         max_consecutive = int(cfg.path("run", "max_consecutive_errors", default=6))
         workers = max(1, int(cfg.path("run", "workers", default=1)))
         workers = min(workers, len(rows)) or 1
+        if getattr(args, "assist", False):
+            workers = 1                       # one tab at a time is all a person can do
 
         # The queue is the only thing the workers share about *what* to do, so a
         # slow site holds up its own worker and nobody else.
@@ -1109,6 +1257,9 @@ def parse_args(argv=None):
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--no-headless", action="store_true", help="show the browser window")
     p.add_argument("--no-resume", action="store_true", help="reprocess rows already done")
+    p.add_argument("--assist", action="store_true",
+                   help="only the needs_human rows, in a visible browser, one at a time: "
+                        "the form is filled and a person submits it")
     p.add_argument("--continue-batch", action="store_true",
                    help="carry on where a stopped run left off: skip every row already "
                         "attempted, dry runs included")

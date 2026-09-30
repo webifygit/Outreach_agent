@@ -162,6 +162,10 @@ form:
                           # send the email instead. false = submit it anyway.
   skip_if_captcha: true    # if a CAPTCHA is present, don't fight it - fall back to email
   accept_consent_checkboxes: true
+  assist_wait_s: 240      # --assist only: how long to wait at each site for the
+                          # person to tick the box / solve the CAPTCHA and press
+                          # Submit. The site stays queued if they run out of time,
+                          # so a short value costs nothing but a second pass.
   max_contact_pages_to_try: 6
 
 email:

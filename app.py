@@ -304,6 +304,33 @@ def _remaining_count() -> int:
     return value
 
 
+_HUMAN_CACHE: dict = {"key": None, "value": 0}
+
+
+def _needs_human_count() -> int:
+    """Rows of the last sheet a person has to finish - what Assist would open."""
+    path = _last_input()
+    if path is None:
+        return 0
+    try:
+        key = (str(path), path.stat().st_mtime, STATE_FILE.stat().st_mtime
+               if STATE_FILE.exists() else 0)
+    except OSError:
+        return 0
+    if _HUMAN_CACHE["key"] == key:
+        return _HUMAN_CACHE["value"]
+    try:
+        from agent.sheet import load_rows
+        rows, _ = load_rows(path)
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+        value = sum(1 for r in rows
+                    if (data.get(r["website"]) or {}).get("status") == "needs_human")
+    except Exception:
+        value = 0
+    _HUMAN_CACHE.update(key=key, value=value)
+    return value
+
+
 def _dry_run_count() -> int:
     """Rows filled but never submitted - what "go live" would actually act on."""
     try:
@@ -321,6 +348,7 @@ def _status() -> dict:
         "problem": _last_problem() if (code not in (0, None)) else "",
         "dry_runs": _dry_run_count(),
         "remaining": _remaining_count(),
+        "needs_human": _needs_human_count(),
         "bounce": dict(BOUNCE),
         "restarts": STATE.get("restarts", 0),
         "can_go_live": _last_input() is not None and not running,
@@ -658,13 +686,15 @@ def _supervise(argv, log_fh):
 
 
 def start_run(input_path: Path, live: bool, headless: bool, limit: int,
-              continue_batch: bool = False, script: str = ""):
+              continue_batch: bool = False, script: str = "", assist: bool = False):
     """Launch run.py under supervision. Caller owns the "already running" check."""
     argv = [sys.executable, "run.py", "--input", str(input_path), "--yes"]
     if script:
         argv += ["--script", script]
     if continue_batch:
         argv.append("--continue-batch")
+    if assist:
+        argv.append("--assist")
     if live:
         argv.append("--live")
     if not headless:
@@ -857,6 +887,27 @@ def resume():
 
     return start_run(path, live=live, headless=True, limit=0, continue_batch=True,
                      script=script)
+
+
+@app.post("/assist")
+def assist():
+    """Open the last sheet's needs_human sites one by one in a visible browser.
+
+    The agent fills each form; the person at the screen ticks the box or
+    solves the CAPTCHA and presses Submit. Always live - there is nothing to
+    rehearse when a person is the one submitting.
+    """
+    with _lock:
+        proc = STATE["proc"]
+        if (proc is not None and proc.poll() is None) or _external_run_active():
+            return jsonify(error="a run is already in progress"), 409
+        path = _last_input()
+        if path is None:
+            return jsonify(error="nothing to assist with - run a sheet first"), 400
+        if not _needs_human_count():
+            return jsonify(error="no sites in this sheet are waiting for a person"), 400
+        script = _last_script()
+    return start_run(path, live=True, headless=False, limit=0, script=script, assist=True)
 
 
 @app.post("/stop")

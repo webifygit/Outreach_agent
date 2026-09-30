@@ -78,6 +78,10 @@ CONSENT_RE = re.compile(
     r"consent|agree|privacy|terms|policy|gdpr|permission|authori[sz]e|i accept", re.I
 )
 MARKETING_OPTIN_RE = re.compile(r"newsletter|subscribe|marketing|updates|promotion", re.I)
+# A plain checkbox whose whole purpose is "prove you are a person". The agent
+# never ticks one of these itself - that is the site's anti-bot control, the
+# same thing as a CAPTCHA - so the site is queued for a person to finish.
+BOT_CHECK_RE = re.compile(r"not a robot|i am human|i'?m human|captcha|spam check|are you human", re.I)
 
 # Options that ask for more than a click - "other" usually reveals a text box
 # that is then required, and an opt-in is not ours to accept.
@@ -362,17 +366,33 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
             pass
 
     # Consent checkboxes: tick required ones, never tick marketing opt-ins.
+    #
+    # Two things used to lose the approach here. A styled checkbox keeps the
+    # real <input> invisible (opacity 0, off-screen) behind a decorative span,
+    # so it was skipped as not visible - and when it was tried, check() timed
+    # out on it and the exception was swallowed. 409 rows in the history ended
+    # "form incomplete: Accept Terms & Conditions (Please check this box...)"
+    # that way. So: consider any fillable (visible OR required) box, and tick
+    # it by whatever works - check, forced check, its label, or plain JS.
+    human_checks: list[str] = []
     if cfg.path("form", "accept_consent_checkboxes", default=True):
         for field in form["fields"]:
-            if field["type"] != "checkbox" or not field["visible"]:
+            if field["type"] != "checkbox" or not fillable(field):
                 continue
-            if MARKETING_OPTIN_RE.search(field["desc"]):
+            desc = field["desc"]
+            if MARKETING_OPTIN_RE.search(desc) and not field["required"]:
                 continue
-            if field["required"] or CONSENT_RE.search(field["desc"]):
-                try:
-                    await frame.check(f"[data-agent-id='{field['agent_id']}']", timeout=4000)
-                except Exception:
-                    pass
+            if BOT_CHECK_RE.search(desc):
+                if field["required"]:
+                    human_checks.append(desc[:60])
+                continue
+            # Every box carrying `required` has to be ticked - the browser
+            # checks them one by one, so a "Preferred contact: Email / Phone"
+            # group marked required on each option needs all of them, not one
+            # of them (that is how radio groups work, not checkboxes).
+            if field["required"] or CONSENT_RE.search(desc):
+                if await _tick(frame, field):
+                    filled[f"checkbox:{(desc or 'consent')[:24]}"] = "ticked"
 
     # Required radio groups - "Please select a vehicle brand", "preferred
     # dealer". Left blank the form is rejected and the site falls back to
@@ -428,7 +448,57 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
         except Exception:  # noqa: BLE001
             missing_required.append(desc[:60] or field["type"])
 
-    return {"filled": filled, "roles": list(roles), "missing_required": missing_required}
+    return {"filled": filled, "roles": list(roles), "missing_required": missing_required,
+            "human_checks": human_checks}
+
+
+async def _tick(frame, field: dict) -> bool:
+    """Tick a checkbox by whatever route the page allows.
+
+    Playwright's check() insists the box be visible and clickable, which the
+    real <input> behind a styled checkbox never is. The decorated label is
+    what a person clicks, so try that next; and when even the label is not
+    reachable, set the property and fire the events a click would have.
+    """
+    sel = f"[data-agent-id='{field['agent_id']}']"
+    try:
+        loc = frame.locator(sel).first
+        if await loc.is_checked():
+            return True
+    except Exception:
+        pass
+    for attempt in ("check", "force", "label", "js"):
+        try:
+            if attempt == "check":
+                await frame.check(sel, timeout=3000)
+            elif attempt == "force":
+                await frame.check(sel, timeout=3000, force=True)
+            elif attempt == "label":
+                clicked = await frame.evaluate("""(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const lab = (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`))
+                                || el.closest('label');
+                    if (!lab) return false;
+                    lab.click();
+                    return true;
+                }""", sel)
+                if not clicked:
+                    continue
+                await frame.wait_for_timeout(200)
+            else:
+                await frame.evaluate("""(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return;
+                    el.checked = true;
+                    for (const t of ['click', 'input', 'change'])
+                        el.dispatchEvent(new Event(t, {bubbles: true}));
+                }""", sel)
+            if await frame.locator(sel).first.is_checked():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # Budget/quantity boxes where a made-up number is worse than an unsent form, and

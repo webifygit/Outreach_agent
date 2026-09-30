@@ -28,6 +28,8 @@ BUCKETS: list[tuple[str, object]] = [
      lambda r, d: r.get("status") == "uncertain"),
     ("Approached - by email",
      lambda r, d: r.get("status") == "sent"),
+    ("Queued - a person has to submit it (CAPTCHA / bot check)",
+     lambda r, d: r.get("status") == "needs_human"),
     ("Blocked - CAPTCHA",
      lambda r, d: bool(CAPTCHA_RE.search(d))),
     ("Not approached - no form found",
