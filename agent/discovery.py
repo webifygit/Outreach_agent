@@ -178,6 +178,10 @@ EXTRACT_FORMS_JS = r"""
         // submit - silently, with the form still on screen.
         fillable: vis || req,
         maxlength: (typeof rawMax === 'number' && rawMax > 0 && rawMax < 100000) ? rawMax : null,
+        // The site's own format rule. Without it the only way to learn that
+        // "+919819915555" is not the shape this form wants is the submit
+        // being refused, which costs the whole approach.
+        pattern: el.getAttribute('pattern') || '',
         desc: describe(el),
         options: tag === 'select'
           ? Array.from(el.options).map(o => ({ value: o.value, text: (o.text || '').trim() })).slice(0, 60)

@@ -254,6 +254,99 @@ SET_VALUE_JS = """(el, value) => {
 }"""
 
 
+def phone_variants(raw: str) -> list[str]:
+    """The same number written the ways a form might demand it.
+
+    Reshapings only - never a different number. A site asking for a local
+    format gets our real one arranged to fit, or nothing.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return []
+    nat = digits[-10:] if len(digits) > 10 else digits
+    cc = digits[:-10] if len(digits) > 10 else ""
+    out = [raw.strip(), digits, f"+{digits}"]
+    if len(nat) == 10:
+        out += [nat,
+                f"{nat[:3]}-{nat[3:6]}-{nat[6:]}",
+                f"({nat[:3]}) {nat[3:6]}-{nat[6:]}",
+                f"{nat[:3]} {nat[3:6]} {nat[6:]}",
+                f"{nat[:5]} {nat[5:]}"]
+    if cc:
+        out += [f"+{cc} {nat}", f"+{cc}-{nat}", f"+{cc} {nat[:5]} {nat[5:]}"]
+    return list(dict.fromkeys(v for v in out if v))
+
+
+FIELD_STATE_JS = """(sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    return {
+        value: el.value == null ? '' : String(el.value),
+        valid: typeof el.checkValidity === 'function' ? el.checkValidity() : true,
+    };
+}"""
+
+
+async def _field_state(frame, sel: str) -> dict | None:
+    try:
+        return await frame.evaluate(FIELD_STATE_JS, sel)
+    except Exception:
+        return None                       # unreadable: leave it alone
+
+
+async def fit_to_pattern(frame, form: dict, roles: dict) -> dict:
+    """Reshape anything the field's own validator refuses.
+
+    225 approaches in the history ended "Cellphone* (Please match the
+    requested format.)" - the number was right and the shape was not, and the
+    browser blocked the submit, silently, with the form still on screen. So
+    ask each field itself: write a variant, call checkValidity(), keep the
+    first shape it accepts.
+
+    Driven off what is in the box rather than off the role, because a form can
+    have several phone fields and only one of them carries the role. An
+    optional field that accepts no variant is cleared - empty is valid, wrong
+    is not - while a required one keeps our value, since blank would fail too
+    and at least a human can read it.
+    """
+    notes: dict[str, str] = {}
+    message = roles.get("message")
+    for field in form["fields"]:
+        if field["tag"] == "select" or field["type"] in {
+                "checkbox", "radio", "hidden", "file", "password", "textarea"}:
+            continue
+        if not fillable(field) or (message is not None and field is message):
+            continue
+        # Only where the site states a format, or the control is a phone box -
+        # those are the two that reject a value we could have written better.
+        if not (field.get("pattern") or field["type"] == "tel"):
+            continue
+        sel = f"[data-agent-id='{field['agent_id']}']"
+        state = await _field_state(frame, sel)
+        if state is None or state["valid"] or not state["value"]:
+            continue
+        current = state["value"]
+        label = (field["desc"] or field["type"])[:24]
+        fixed = ""
+        for candidate in phone_variants(current):
+            if candidate == current:
+                continue
+            if not await _set_value(frame, sel, candidate, False):
+                continue
+            after = await _field_state(frame, sel)
+            if after and after["valid"]:
+                fixed = candidate
+                break
+        if fixed:
+            notes[f"reformatted:{label}"] = fixed
+        elif not field["required"]:
+            await _set_value(frame, sel, "", False)
+            notes[f"cleared:{label}"] = "no format of it was accepted, and it was optional"
+        else:
+            await _set_value(frame, sel, current, False)
+    return notes
+
+
 async def _set_value(frame, sel: str, value: str, is_select: bool) -> bool:
     """Fill one control, falling back to setting it inside the page.
 
@@ -447,6 +540,12 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
                 missing_required.append(desc[:60] or field["type"])
         except Exception:  # noqa: BLE001
             missing_required.append(desc[:60] or field["type"])
+
+    # Last, because it asks the browser to judge what is already in the field.
+    try:
+        filled.update(await fit_to_pattern(frame, form, roles))
+    except Exception:
+        pass
 
     return {"filled": filled, "roles": list(roles), "missing_required": missing_required,
             "human_checks": human_checks}
