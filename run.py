@@ -449,10 +449,11 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
             # the page is watched for the same evidence an automatic submit
             # is judged on.
             wait_s = float(cfg.path("form", "assist_wait_s", default=240))
-            try:
-                await page.bring_to_front()
-            except Exception:
-                pass
+            if int(cfg.path("form", "assist_tabs", default=5)) <= 1:
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
             log(f"    HUMAN: form filled in the open tab - tick the box / solve the "
                 f"CAPTCHA and press Submit (waiting up to {wait_s:.0f}s)", logfile)
             before_url = page.url
@@ -480,6 +481,16 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
             return True
 
         if rejected:
+            if not cfg.path("email", "enabled", default=True):
+                # The form is here and filled, and one control is all that
+                # stands between it and a submission: a checkbox that would not
+                # take a tick, a field with a rule we could not meet. A person
+                # finishes that in seconds, so queue it for a tab instead of
+                # filing it as a failure nobody ever looks at.
+                result["status"] = "needs_human"
+                result["detail"] += (f"the browser would reject it {rejected} - queued for "
+                                     "assisted submission: a person finishes it in a tab")
+                return True
             # Clicking would be a no-op. Hand the row to the email fallback.
             result["status"] = "failed"
             result["detail"] += "not submitted - the browser would reject it"
@@ -732,6 +743,12 @@ async def main_async(args) -> int:
         cfg["run"]["mode"] = "live"
     if args.no_headless or getattr(args, "assist", False):
         cfg["run"]["headless"] = False
+    if getattr(args, "assist", False):
+        # A person is going to solve a CAPTCHA in this window, so use their real
+        # Chrome when it is installed - open_browser falls back to the bundled
+        # browser when it is not.
+        if not str(cfg.path("run", "browser_channel", default="") or "").strip():
+            cfg["run"]["browser_channel"] = "chrome"
 
     logfile = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log"))
     logfile.parent.mkdir(parents=True, exist_ok=True)
@@ -820,7 +837,12 @@ async def main_async(args) -> int:
     # is keyed by URL, so recording a skip would overwrite the very record of
     # the original contact we are trying to preserve.
     dup_skips: list[dict] = []
-    if cfg.path("run", "skip_already_contacted", default=True) and not cfg.get("_follow_up"):
+    # An assisted run is exempt too. Its rows are the ones a person has to
+    # finish, and a queued row was never contacted - but the business behind it
+    # may well have been on an earlier touch, which is exactly what this guard
+    # looks for. Left in, it drops the very sites the run exists to open.
+    if (cfg.path("run", "skip_already_contacted", default=True)
+            and not cfg.get("_follow_up") and not getattr(args, "assist", False)):
         fresh = []
         for r in rows:
             prior = state.contacted_site(r["website"])
@@ -980,11 +1002,15 @@ async def main_async(args) -> int:
     async with async_playwright() as pw:
         watch = asyncio.create_task(watchdog())
         recycle_every = int(cfg.path("run", "recycle_browser_every", default=50))
+        if getattr(args, "assist", False):
+            recycle_every = 0                 # never retire a window a person is using
         max_consecutive = int(cfg.path("run", "max_consecutive_errors", default=6))
         workers = max(1, int(cfg.path("run", "workers", default=1)))
         workers = min(workers, len(rows)) or 1
         if getattr(args, "assist", False):
-            workers = 1                       # one tab at a time is all a person can do
+            # Tabs in one window (see shared_browser below). More than a
+            # handful at once is not something a person can work through.
+            workers = max(1, min(int(cfg.path("form", "assist_tabs", default=5)), len(rows)))
 
         # The queue is the only thing the workers share about *what* to do, so a
         # slow site holds up its own worker and nobody else.
@@ -1007,6 +1033,9 @@ async def main_async(args) -> int:
         # TargetClosedError (measured: within 3s), so that worker records the
         # site and carries on. The others never notice.
         beats: dict[int, dict] = {}
+        # Assisted runs: one browser window whose tabs are the sites, so a
+        # person works down them instead of waiting for one window at a time.
+        shared_browser = None
 
         async def worker_watchdog():
             # Normally 1.5x the per-site ceiling, so asyncio's own timeout gets
@@ -1018,6 +1047,9 @@ async def main_async(args) -> int:
             while True:
                 await asyncio.sleep(10)
                 now = time.time()
+                if shared_browser is not None:
+                    continue                  # every tab shares one process: killing
+                                              # it would close the tabs a person is in
                 for wid, hb in list(beats.items()):
                     # A worker that has finished is not stuck. Everything else
                     # is fair game - including shutdown, which is where the
@@ -1040,12 +1072,21 @@ async def main_async(args) -> int:
 
         beat_watch = asyncio.create_task(worker_watchdog())
 
+        if getattr(args, "assist", False):
+            shared_browser = await open_browser(pw, cfg)
+            log(f"assisted run: opening {workers} tab(s) at a time in one browser window. "
+                f"Each form arrives filled - tick the box or solve the CAPTCHA, press the "
+                f"site's own Submit, and the result is recorded like any other.", logfile)
+
         async def run_worker(wid: int):
             nonlocal done_count, consecutive_errors
             browser = context = None
             for attempt in range(1, 4):
                 try:
-                    browser, context, bpid = await open_browser(pw, cfg)
+                    if shared_browser is not None:
+                        browser, context, bpid = shared_browser
+                    else:
+                        browser, context, bpid = await open_browser(pw, cfg)
                     break
                 except Exception as exc:  # noqa: BLE001
                     log(f"w{wid} could not start a browser ({type(exc).__name__}) - "
@@ -1176,14 +1217,15 @@ async def main_async(args) -> int:
                 hb = beats.get(wid)
                 if hb is not None:
                     hb.update(at=time.time(), site="")
-                try:
-                    await asyncio.wait_for(context.close(), timeout=15)
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(browser.close(), timeout=15)
-                except Exception:
-                    pass
+                if shared_browser is None:
+                    try:
+                        await asyncio.wait_for(context.close(), timeout=15)
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(browser.close(), timeout=15)
+                    except Exception:
+                        pass
                 # only now is this worker genuinely finished; until this point
                 # the watchdog is still entitled to kill its browser
                 if hb is not None:
@@ -1199,6 +1241,11 @@ async def main_async(args) -> int:
                 # log to say so.
                 log(f"w{i} ended on an unhandled {type(outcome).__name__}: "
                     f"{str(outcome)[:160]}", logfile)
+        if shared_browser is not None:
+            try:
+                await asyncio.wait_for(shared_browser[0].close(), timeout=15)
+            except Exception:
+                pass
         # results arrive in completion order; the sheet's order is what readers expect
         results.sort(key=lambda r: r.get("row_index", 0))
         watch.cancel()

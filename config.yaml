@@ -166,6 +166,8 @@ form:
                           # person to tick the box / solve the CAPTCHA and press
                           # Submit. The site stays queued if they run out of time,
                           # so a short value costs nothing but a second pass.
+  assist_tabs: 5          # --assist only: how many sites to open as tabs at once
+                          # in the one browser window a person works in.
   max_contact_pages_to_try: 6
 
 email:

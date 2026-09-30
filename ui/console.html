@@ -725,7 +725,7 @@ tbody tr:hover { transform: translateX(2px); }
         </div>
         <div class="inline-row" id="assistRow" hidden>
           <span class="count" id="assistCount">0</span>
-          <button class="b-go" id="assistBtn" title="Opens each CAPTCHA site in a visible browser with the form already filled. You tick the box or solve the CAPTCHA and press Submit; the result is recorded like any other.">Open CAPTCHA sites for me to submit</button>
+          <button class="b-go" id="assistBtn" title="Opens the sites the agent could not finish - a CAPTCHA, an &quot;I am not a robot&quot; box, a control that would not take a tick - as tabs in one browser window, each with the form already filled. You finish it and press the site's own Submit; the result is recorded like any other.">Open the sites that need a person</button>
         </div>
         <div class="inline-row" id="bounceRow">
           <button class="b-bounce" id="bounceBtn" style="width:100%">Check bounces</button>
@@ -1361,11 +1361,11 @@ $('resumeBtn').addEventListener('click', async () => {
 
 $('assistBtn').addEventListener('click', async () => {
   const n = $('assistCount').textContent;
-  if (!confirm(`Open ${n} site(s) one at a time in a visible browser?\n\nEach form arrives already filled. You tick the box or solve the CAPTCHA and press Submit; the agent waits up to 4 minutes per site, records the result, then opens the next one. Close the tab to skip a site.`)) return;
+  if (!confirm(`Open ${n} site(s) that need a person?\n\nThey open as tabs in one browser window, a few at a time, each with the form already filled. Tick the box or solve the CAPTCHA and press the site's own Submit button. The agent watches each tab, records the result, then opens the next site. Close a tab to skip that site; anything you do not get to stays queued.`)) return;
   const btn = $('assistBtn'); btn.disabled = true;
   btn.innerHTML = 'Opening <span class="dots"><i></i><i></i><i></i></span>';
   const data = await post('/assist');
-  btn.textContent = 'Open CAPTCHA sites for me to submit';
+  btn.textContent = 'Open the sites that need a person';
   if (data.error) { toast('Could not start', data.error, 'err'); btn.disabled = false; return; }
   toast('Assisted run started', n + ' site(s) - watch the browser window', 'ok');
   startPolling();
