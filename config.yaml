@@ -162,6 +162,17 @@ form:
                           # send the email instead. false = submit it anyway.
   skip_if_captcha: true    # if a CAPTCHA is present, don't fight it - fall back to email
   accept_consent_checkboxes: true
+  live_assist: false       # during a LIVE forms-only run, a CAPTCHA site is
+                          # reopened in a visible browser window with the form
+                          # already filled, so you can solve it and submit it
+                          # there and then. Set false to go back to queueing
+                          # every one of them for a later assisted pass.
+  live_assist_tabs: 8     # how many of those tabs may be open at once. Each is
+                          # a live page in memory, so this is a memory setting
+                          # as much as a workload one.
+  live_assist_wait_s: 900 # how long a handed-over tab waits for you before the
+                          # site goes back in the queue. The run does not finish
+                          # while tabs are still open.
   assist_wait_s: 240      # --assist only: how long to wait at each site for the
                           # person to tick the box / solve the CAPTCHA and press
                           # Submit. The site stays queued if they run out of time,

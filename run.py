@@ -305,7 +305,8 @@ def _embed_label(form: dict) -> str:
     return host or "same-origin iframe"
 
 
-async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None):
+async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None,
+                  handoff=None):
     url = row["website"]
     idx = row["row_index"]
     form_sender = pick_sender(cfg, idx, "form_senders")
@@ -382,12 +383,20 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
             result["detail"] = f"CAPTCHA present ({captcha}) - falling back to email. "
         else:
             # Nothing automatic can be done with this form, and email is off.
-            # Rather than "skipped", keep it: an assisted run opens it in a
-            # visible browser with every field filled, and a person does the
-            # one thing the site reserves for people.
-            result.update(method="form", status="needs_human",
-                          detail=(f"CAPTCHA present ({captcha}) - queued for assisted "
-                                  "submission: a person solves it in an open tab"))
+            result["method"] = "form"
+            result["detail"] = f"CAPTCHA present ({captcha}) - "
+            # Hand it straight over if there is a free tab: the person can
+            # submit it now, while the other workers carry on.
+            if handoff is not None and handoff.has_room():
+                if await handoff.offer(row, result, contact_url or page.url, ctx,
+                                       subject, idx):
+                    result["status"] = "_handed_off"
+                    await page.close()
+                    return result
+            # No window, or no room in it - queue it for an assisted pass.
+            result["status"] = "needs_human"
+            result["detail"] += ("queued for assisted submission: a person solves it "
+                                 "in an open tab")
             result["screenshot_before"] = await ev.shot(page, idx, url, "01_page")
             await page.close()
             return result
@@ -686,6 +695,169 @@ async def wait_for_human(page, frame, form_key: str, before_url: str, before_bod
     # in between - a stray "required" in the footer reads as a validation error
     # - nothing was sent, so the site stays queued rather than becoming a fail.
     return None
+
+
+class LiveHandOff:
+    """CAPTCHA sites kept open as tabs for a person while the run carries on.
+
+    The tabs live in their own visible browser, never in a worker's: a worker
+    retires its browser every `recycle_browser_every` sites, which would close
+    a tab someone was halfway through. Each site is loaded again there and
+    filled, so the person finds it ready and only has to solve the challenge
+    and press the site's own Submit.
+
+    A handed-over row is NOT recorded by the worker - this owns it until the
+    person submits, closes the tab, or the clock runs out - so one approach
+    stays one touch in the history rather than two.
+    """
+
+    def __init__(self, browser, context, cfg, env, ev, state, results, logfile,
+                 script_key, follow_up, limit, wait_s):
+        self.browser, self.context = browser, context
+        self.cfg, self.env, self.ev, self.state = cfg, env, ev, state
+        self.results, self.logfile = results, logfile
+        self.script_key, self.follow_up = script_key, follow_up
+        self.limit, self.wait_s = max(1, limit), max(30.0, wait_s)
+        self.open: list[dict] = []
+        self.handed = self.submitted = 0
+
+    def has_room(self) -> bool:
+        return len(self.open) < self.limit and self.browser.is_connected()
+
+    async def offer(self, row, result, url, ctx, subject, idx) -> bool:
+        """Load the site in the visible window and fill it. True if it is open."""
+        if not self.has_room():
+            return False
+        timeout = int(self.cfg.path("run", "page_timeout_ms", default=30000))
+        page = None
+        try:
+            page = await self.context.new_page()
+            page.set_default_timeout(timeout)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            await discovery.settle(page)
+            ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
+            if not ranked or ranked[0][0] < 40:
+                raise RuntimeError("no form on the reopened page")
+            _score, form, frame = ranked[0]
+            report = await filler.fill_form(frame, form, self.cfg, ctx, self.env, subject)
+            shot = await self.ev.shot(page, idx, row["website"], "01_filled_for_you")
+            before_body = await filler.read_context_body(page, frame)
+            await arm_submit_watch(frame if frame is not None else page, form["form_key"])
+        except Exception as exc:  # noqa: BLE001
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            log(f"    could not open it for you ({type(exc).__name__}) - queued instead",
+                self.logfile)
+            return False
+
+        result["screenshot_before"] = shot
+        result["detail"] += (f"filled {report['roles']} and left open as a tab "
+                             f"for you to submit. ")
+        self.open.append({
+            "row": row, "result": result, "page": page, "frame": frame,
+            "form_key": form["form_key"], "before_url": page.url,
+            "before_body": before_body, "idx": idx,
+            "deadline": time.monotonic() + self.wait_s,
+        })
+        self.handed += 1
+        log(f"    OPEN IN THE BROWSER WINDOW - solve the challenge and press Submit "
+            f"({len(self.open)} tab(s) waiting for you)", self.logfile)
+        return True
+
+    async def watch(self) -> None:
+        while True:
+            await asyncio.sleep(2)
+            await self._sweep()
+
+    async def _sweep(self) -> None:
+        for entry in list(self.open):
+            try:
+                verdict = await self._poll(entry)
+            except Exception:  # noqa: BLE001
+                verdict = ("needs_human", "the tab could not be read", "weak")
+            if verdict is not None:
+                await self._finish(entry, verdict)
+
+    async def _poll(self, entry):
+        """None while it is still waiting; a verify_submission triple when done."""
+        page, frame = entry["page"], entry["frame"]
+        if page.is_closed():
+            return ("needs_human", "you closed the tab before submitting it", "strong")
+        scope = frame if frame is not None else page
+        try:
+            url = page.url
+            landed = (url != entry["before_url"]
+                      and re.search(r"thank|success|sent|submitted", url, re.I))
+            clicked = False if landed else bool(
+                await scope.evaluate("() => !!window.__agentSubmitted"))
+        except Exception:
+            if page.is_closed():
+                return ("needs_human", "you closed the tab before submitting it", "strong")
+            return None                      # navigating; look again shortly
+        if landed or clicked:
+            verdict = await filler.verify_submission(
+                page, frame, entry["before_url"], entry["form_key"], entry["before_body"])
+            if verdict[0] in ("success", "uncertain"):
+                return verdict
+            try:                             # refused - let them fix it and click again
+                entry["before_url"] = page.url
+                entry["before_body"] = await filler.read_context_body(page, frame)
+                await arm_submit_watch(scope, entry["form_key"])
+            except Exception:
+                pass
+            return None
+        if time.monotonic() > entry["deadline"]:
+            return ("needs_human", f"not submitted within {self.wait_s / 60:.0f} minutes "
+                                   f"- still queued", "strong")
+        return None
+
+    async def _finish(self, entry, verdict) -> None:
+        status, detail, _strength = verdict
+        result, page = entry["result"], entry["page"]
+        if not page.is_closed():
+            try:
+                result["screenshot_after"] = await self.ev.shot(
+                    page, entry["idx"], entry["row"]["website"], "02_after_submit")
+            except Exception:
+                pass
+            try:
+                await page.close()
+            except Exception:
+                pass
+        # No awaits past this point: a worker mutates these same two objects and
+        # neither is behind a lock, so the update has to be one atomic step.
+        if entry in self.open:
+            self.open.remove(entry)
+        result["status"] = status
+        result["detail"] += detail
+        result["script"] = self.script_key
+        result["follow_up"] = self.follow_up
+        self.results.append(result)
+        self.state.record(entry["row"]["website"], result)
+        if status in ("success", "uncertain"):
+            self.submitted += 1
+        log(f"    you -> {status} :: {entry['row']['website']} :: {detail[:90]}",
+            self.logfile)
+
+    async def drain(self) -> None:
+        """Let the person finish what is still open, then shut the window."""
+        if self.open:
+            log(f"{len(self.open)} tab(s) still open - waiting for you (up to "
+                f"{self.wait_s / 60:.0f} min each). Close a tab to skip that site.",
+                self.logfile)
+        while self.open:
+            await asyncio.sleep(2)
+            await self._sweep()
+        if self.handed:
+            log(f"hand-over: you submitted {self.submitted} of {self.handed} tab(s)",
+                self.logfile)
+        try:
+            await asyncio.wait_for(self.browser.close(), timeout=15)
+        except Exception:
+            pass
 
 
 class RunLock:
@@ -1086,6 +1258,38 @@ async def main_async(args) -> int:
 
         beat_watch = asyncio.create_task(worker_watchdog())
 
+        # A visible window that CAPTCHA sites are handed to while the run goes
+        # on. Only for a live, forms-only run: in a dry run there is nothing to
+        # submit, and with email enabled these sites take the email path.
+        handoff = None
+        hand_watch = None
+        if (cfg.live and not getattr(args, "assist", False)
+                and cfg.path("form", "live_assist", default=False)
+                and not cfg.path("email", "enabled", default=True)):
+            was_headless = cfg.path("run", "headless", default=True)
+            was_channel = cfg.path("run", "browser_channel", default="")
+            cfg["run"]["headless"] = False
+            if not str(was_channel or "").strip():
+                cfg["run"]["browser_channel"] = "chrome"   # their real Chrome if present
+            try:
+                hb, hctx, _hpid = await open_browser(pw, cfg)
+                handoff = LiveHandOff(
+                    hb, hctx, cfg, env, ev, state, results, logfile, script_key,
+                    bool(cfg.get("_follow_up")),
+                    int(cfg.path("form", "live_assist_tabs", default=8)),
+                    float(cfg.path("form", "live_assist_wait_s", default=900)))
+                hand_watch = asyncio.create_task(handoff.watch())
+                log(f"a browser window is open for you: CAPTCHA sites arrive there as "
+                    f"filled tabs, up to {handoff.limit} at a time - solve each and press "
+                    f"its Submit. Anything beyond that is queued as usual.", logfile)
+            except Exception as exc:  # noqa: BLE001
+                log(f"could not open the window for manual submissions "
+                    f"({type(exc).__name__}) - CAPTCHA sites will be queued instead",
+                    logfile)
+            finally:
+                cfg["run"]["headless"] = was_headless
+                cfg["run"]["browser_channel"] = was_channel
+
         if getattr(args, "assist", False):
             shared_browser = await open_browser(pw, cfg)
             log(f"assisted run: opening {workers} tab(s) at a time in one browser window. "
@@ -1147,7 +1351,8 @@ async def main_async(args) -> int:
                             # block in ways the browser timeout does not cover,
                             # so the whole per-site pipeline gets one ceiling.
                             res = await asyncio.wait_for(
-                                process(row, context, cfg, env, mailer, ev, args, logfile, state),
+                                process(row, context, cfg, env, mailer, ev, args,
+                                        logfile, state, handoff),
                                 timeout=site_timeout,
                             )
                             break
@@ -1191,14 +1396,23 @@ async def main_async(args) -> int:
                     # follow-up is indistinguishable from a first approach once
                     # written, and the dashboard counts one business twice as
                     # if two had been reached.
-                    res["script"] = script_key
-                    res["follow_up"] = bool(cfg.get("_follow_up"))
-                    results.append(res)
-                    state.record(row["website"], res)
-                    since_recycle += 1
-                    done_count += 1
-                    log(f"{tag}    -> {res['method'] or '-'} / {res['status']} "
-                        f":: {res['detail'][:110]}", logfile)
+                    if res.get("status") == "_handed_off":
+                        # LiveHandOff owns this row until the person is done with
+                        # it, and records it then - recording it here as well
+                        # would make one approach look like two touches.
+                        since_recycle += 1
+                        done_count += 1
+                        log(f"{tag}    -> form / waiting for you "
+                            f":: {res['detail'][:110]}", logfile)
+                    else:
+                        res["script"] = script_key
+                        res["follow_up"] = bool(cfg.get("_follow_up"))
+                        results.append(res)
+                        state.record(row["website"], res)
+                        since_recycle += 1
+                        done_count += 1
+                        log(f"{tag}    -> {res['method'] or '-'} / {res['status']} "
+                            f":: {res['detail'][:110]}", logfile)
                     # This sheet's own numbers - not the running total across every
                     # sheet ever uploaded, which is what the overall dashboard is for.
                     build_report(dup_skips + blocked + results, report_mode, report_path)
@@ -1260,6 +1474,12 @@ async def main_async(args) -> int:
                 await asyncio.wait_for(shared_browser[0].close(), timeout=15)
             except Exception:
                 pass
+        if handoff is not None:
+            # Its own watcher stops first, so draining is the only thing polling
+            # those tabs and an entry cannot be finished twice.
+            if hand_watch is not None:
+                hand_watch.cancel()
+            await handoff.drain()
         # results arrive in completion order; the sheet's order is what readers expect
         results.sort(key=lambda r: r.get("row_index", 0))
         watch.cancel()
