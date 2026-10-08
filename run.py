@@ -831,6 +831,41 @@ async def main_async(args) -> int:
     state = State(state_path,
                   dedupe_scope=str(cfg.path("run", "dedupe_scope", default="host")),
                   sheet=Path(args.input).name)
+    # Two separate lists, because the reasons are not the same and only one of
+    # them is a judgement about the business: skip_sites is a technical
+    # measure, do_not_contact is an instruction. Kept apart so neither can be
+    # quietly widened by the other, and so the sheet says which applied.
+    blocked: list[dict] = []
+    skip_hosts = {norm_site(u, scope)
+                  for u in (cfg.path("run", "skip_sites", default=[]) or [])}
+    dnc_hosts = {norm_site(u, scope)
+                 for u in (cfg.path("run", "do_not_contact", default=[]) or [])}
+    if skip_hosts or dnc_hosts:
+        keep = []
+        for r in rows:
+            host = norm_site(r["website"], scope)
+            if host in dnc_hosts:
+                reason, status = ("on run.do_not_contact - excluded by instruction; "
+                                  "not approached and not followed up"), "skipped_excluded"
+            elif host in skip_hosts:
+                reason, status = ("on run.skip_sites - this site wedges the browser; "
+                                  "skipped so it cannot stall the batch"), "skipped_blocked"
+            else:
+                keep.append(r)
+                continue
+            blocked.append({
+                "row_index": r["row_index"], "website": r["website"],
+                "company_name": r["company_name"],
+                "method": "none", "status": status, "detail": reason,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            })
+        n_dnc = sum(1 for b in blocked if b["status"] == "skipped_excluded")
+        if n_dnc:
+            log(f"{n_dnc} site(s) skipped by run.do_not_contact", logfile)
+        if len(blocked) - n_dnc:
+            log(f"{len(blocked) - n_dnc} site(s) skipped by run.skip_sites", logfile)
+        rows = keep
+
     # Re-uploading a sheet must not make already-approached rows disappear: they
     # are carried through as their own list, into the results file, the
     # dashboard and the ledger. Deliberately NOT written back into state - that
@@ -880,27 +915,6 @@ async def main_async(args) -> int:
     # full process restart - every worker loses its place, not just the one
     # that hit it - so skipping them is far cheaper than attempting them. They
     # are recorded, not silently dropped, so the sheet still accounts for them.
-    blocked: list[dict] = []
-    skip_hosts = {norm_site(u, scope)
-                  for u in (cfg.path("run", "skip_sites", default=[]) or [])}
-    if skip_hosts:
-        keep = []
-        for r in rows:
-            if norm_site(r["website"], scope) in skip_hosts:
-                blocked.append({
-                    "row_index": r["row_index"], "website": r["website"],
-                    "company_name": r["company_name"],
-                    "method": "none", "status": "skipped_blocked",
-                    "detail": "on run.skip_sites - this site wedges the browser; "
-                              "skipped so it cannot stall the batch",
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                })
-            else:
-                keep.append(r)
-        if blocked:
-            log(f"{len(blocked)} site(s) skipped by run.skip_sites", logfile)
-        rows = keep
-
     # Rows this sheet no longer has to visit because an earlier attempt already
     # covered them. They leave `rows`, so without carrying the number forward
     # the progress counter restarts from zero against a shrinking total on every

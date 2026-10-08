@@ -44,6 +44,8 @@ BUCKETS: list[tuple[str, object]] = [
      lambda r, d: r.get("status") in ("failed", "error")),
     ("Not approached - blocklisted (wedges browser)",
      lambda r, d: r.get("status") == "skipped_blocked"),
+    ("Not approached - excluded by instruction",
+     lambda r, d: r.get("status") == "skipped_excluded"),
     ("Already approached earlier",
      lambda r, d: r.get("status") == "skipped_duplicate"),
     ("Rehearsal only (dry run)",
