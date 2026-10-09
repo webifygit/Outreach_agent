@@ -136,6 +136,14 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
     ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
     if ranked and ranked[0][0] >= 60:
         return page, ranked, page.url
+    if not ranked or ranked[0][0] < 40:
+        # Nothing on the homepage yet. Scroll before moving on: the form may
+        # simply not have been in view. Cheap, and only on pages that would
+        # otherwise be given up on.
+        await discovery.reveal(page)
+        ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
+        if ranked and ranked[0][0] >= 60:
+            return page, ranked, page.url
 
     limit = int(cfg.path("form", "max_contact_pages_to_try", default=6))
     candidates = await discovery.find_contact_links(page, page.url, limit)
@@ -170,9 +178,18 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
         ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if (not ranked or ranked[0][0] < 40):
             # Nothing yet is usually a form that has not mounted, not a page
-            # without one. Look once more before writing the page off.
+            # without one. Look once more before writing the page off - and
+            # scroll, because a form below the fold on a Webflow/Next site is
+            # built when it comes into view and is invisible until then. Only
+            # with budget to spare: this runs on the pages that are currently
+            # being lost, and it must not spend the time that finds the next
+            # candidate's form.
             await discovery.settle(page, 2000, adaptive)
             ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
+            spare = None if deadline is None else deadline - time.monotonic()
+            if (not ranked or ranked[0][0] < 40) and (spare is None or spare > 8):
+                await discovery.reveal(page)
+                ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if ranked and ranked[0][0] > best_score:
             best_score, best = ranked[0][0], (page, ranked, page.url)
         if best_score >= 60:

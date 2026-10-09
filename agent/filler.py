@@ -8,6 +8,7 @@ frame boundary, so scoping to the owner is what makes both cases identical.
 from __future__ import annotations
 
 import re
+import time
 
 from .templating import render_file
 
@@ -60,6 +61,12 @@ SUBMIT_SELECTORS = [
     "a:has-text('Submit')",
     "button",
 ]
+
+# How long verify_submission keeps watching for a confirmation after the first
+# look. A module constant rather than a config value because every caller must
+# judge a submission the same way, including the hand-off watcher, which has no
+# config to hand.
+VERIFY_WATCH_S = 8.0
 
 SUCCESS_TEXT_RE = re.compile(
     r"thank(s| you)|we('| ha)?ve received|message (has been )?sent|successfully|"
@@ -722,6 +729,25 @@ async def verify_submission(page, frame, before_url: str, form_key: str,
         pass
     await page.wait_for_timeout(2500)
 
+    # A form that posts over AJAX answers when it answers. One snapshot at
+    # 2.5s called 951 submissions on one sheet "no confirmation or error
+    # detected" - as many as that sheet's confirmed successes - so keep looking
+    # for a few seconds before settling for that.
+    deadline = time.monotonic() + VERIFY_WATCH_S
+    while True:
+        verdict = await _read_outcome(page, frame, before_url, form_key, before_body)
+        if verdict is not None:
+            return verdict
+        if time.monotonic() >= deadline:
+            break
+        await page.wait_for_timeout(1000)
+    return await _read_outcome(page, frame, before_url, form_key, before_body,
+                               final=True)
+
+
+async def _read_outcome(page, frame, before_url: str, form_key: str,
+                        before_body: str, final: bool = False):
+    """One look at the page. None means "nothing decisive yet"."""
     after_url = page.url
     # Submitting can detach and replace the embed's frame; that on its own
     # is a decent success signal, but only alongside the text checks below.
@@ -754,7 +780,18 @@ async def verify_submission(page, frame, before_url: str, form_key: str,
 
     try:
         if await scope.locator(f"form[data-agent-form='{form_key}']").count() == 0:
-            return "success", "form removed from page after submit", "structural"
+            # Mid-navigation the form is briefly absent from a page that is
+            # simply being replaced, and this is now read several times rather
+            # than once, so only trust it on a page that has finished loading.
+            settled = True
+            if not final:
+                try:
+                    settled = (await page.evaluate("() => document.readyState")) == "complete"
+                except Exception:
+                    settled = False
+            if settled:
+                return "success", "form removed from page after submit", "structural"
+            return None
     except Exception:
         # Reading a detached frame throws - the embed tore its form down, which
         # is what a hosted form does once it has accepted the submission.
@@ -765,6 +802,8 @@ async def verify_submission(page, frame, before_url: str, form_key: str,
             except Exception:
                 pass
 
+    if not final:
+        return None                      # keep watching; the answer may still arrive
     if after_url != before_url:
         return "uncertain", f"navigated to {after_url}, no confirmation text found{stale_note}", "weak"
     return "uncertain", f"no confirmation or error detected - check the screenshot{stale_note}", "weak"
