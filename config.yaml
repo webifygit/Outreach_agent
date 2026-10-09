@@ -173,6 +173,10 @@ form:
   live_assist_wait_s: 900 # how long a handed-over tab waits for you before the
                           # site goes back in the queue. The run does not finish
                           # while tabs are still open.
+  reveal_attempts: 2      # how many pages per SITE may be scrolled to wake a
+                          # lazily-mounted form. Each costs ~1.8s and a site can
+                          # have seven candidate pages: doing it everywhere took
+                          # the median site 16s -> 32s and timeouts 8% -> 29%.
   assist_wait_s: 240      # --assist only: how long to wait at each site for the
                           # person to tick the box / solve the CAPTCHA and press
                           # Submit. The site stays queued if they run out of time,

@@ -130,16 +130,22 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
     """
     contact_candidates = contact_candidates if contact_candidates is not None else []
     adaptive = bool(cfg.path("run", "adaptive_settle", default=True))
+    # Scrolling a page to wake a lazily-mounted form costs about 1.8s, and
+    # locate_form sees up to seven pages per site. Doing it on each one doubled
+    # the median site from 16s to 32s and took timeouts from 8% to 29% - and a
+    # timeout is worse than no form found, because the row is never retried.
+    # So it is a per-SITE allowance, spent on the pages most likely to pay.
+    reveals_left = int(cfg.path("form", "reveal_attempts", default=2))
     last_good_url = page.url  # most recent page that actually loaded (status < 400)
     best = (page, [], page.url)  # always a real page, even if no form is ever found
     await discovery.settle(page, 900, adaptive)
     ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
     if ranked and ranked[0][0] >= 60:
         return page, ranked, page.url
-    if not ranked or ranked[0][0] < 40:
+    if (not ranked or ranked[0][0] < 40) and reveals_left:
         # Nothing on the homepage yet. Scroll before moving on: the form may
-        # simply not have been in view. Cheap, and only on pages that would
-        # otherwise be given up on.
+        # simply not have been in view.
+        reveals_left -= 1
         await discovery.reveal(page)
         ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if ranked and ranked[0][0] >= 60:
@@ -187,7 +193,9 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
             await discovery.settle(page, 2000, adaptive)
             ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
             spare = None if deadline is None else deadline - time.monotonic()
-            if (not ranked or ranked[0][0] < 40) and (spare is None or spare > 8):
+            if ((not ranked or ranked[0][0] < 40) and reveals_left
+                    and (spare is None or spare > 12)):
+                reveals_left -= 1
                 await discovery.reveal(page)
                 ranked = discovery.rank_forms(await discovery.forms_everywhere(page))
         if ranked and ranked[0][0] > best_score:
