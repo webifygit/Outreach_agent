@@ -37,3 +37,20 @@ utah_ecommerce_output/
 
 # OS
 .DS_Store
+
+# --- Local-only identity configs (real team/client names, emails, phones) ---
+# Same category as config.local.yaml: per-machine copies filled with real
+# sender contact details. The header inside each says "gitignored" - make it so.
+config.pest.yaml
+config.pest_la.yaml
+config.targeted.yaml
+
+# --- Run outputs & lead/prospect data (client data, not code) ---
+ai_hiring_targets/
+dental_batch/
+followup_sheets/
+london_hotels_output/
+output_pest/
+output_pest_la/
+pest_control_us/
+us_tech_output/

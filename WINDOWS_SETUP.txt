@@ -1,0 +1,64 @@
+CONTACT AGENT ON A WINDOWS PC
+=============================
+
+What you copied: the agent's code, templates, your config (identities and
+pitch scripts), and output/state.json - the ledger of every site already
+contacted, so the duplicate guard keeps working on the new PC.
+
+------------------------------------------------------------
+STEP 1 - Unzip
+------------------------------------------------------------
+Right-click contact_agent_windows.zip > Extract All. Put the folder
+somewhere easy, e.g.  C:\Users\<you>\Desktop\Outreach_agent
+
+------------------------------------------------------------
+STEP 2 - Install Python (once)
+------------------------------------------------------------
+Open Command Prompt and type:    py --version
+If it errors, install Python from https://www.python.org/downloads/
+and on the FIRST installer screen tick "Add python.exe to PATH".
+Close and reopen Command Prompt afterwards.
+
+------------------------------------------------------------
+STEP 3 - Set up the agent (once)
+------------------------------------------------------------
+In File Explorer open the Outreach_agent folder, click the address bar,
+type  cmd  and press Enter. Then run, one line at a time:
+
+    py -m venv .venv
+    .venv\Scripts\python -m pip install -r requirements.txt
+    .venv\Scripts\python -m playwright install chromium
+
+(The last line downloads a ~150 MB browser used only by the agent.)
+
+------------------------------------------------------------
+STEP 4 - Run it
+------------------------------------------------------------
+Double-click  start_agent.ps1  (or right-click > Run with PowerShell).
+If PowerShell complains about scripts being disabled, run instead:
+
+    .venv\Scripts\python app.py
+
+Then open  http://127.0.0.1:5000  in the browser, upload a sheet, pick the
+pitch script, and Start - same console as on the Mac.
+
+------------------------------------------------------------
+IMPORTANT - two machines, one rule: never contact a site twice
+------------------------------------------------------------
+Each PC keeps its own output/state.json ledger. The copy in this zip knows
+everything contacted up to the day it was made, but the two machines do NOT
+sync after that. So:
+
+  - NEVER run the same spreadsheet on both machines.
+  - Split lists cleanly: one file for the Mac, a different file for this PC,
+    no overlapping companies.
+  - After big runs, swap state.json files (or ask Claude on the Mac to merge
+    them) so both ledgers know what the other machine sent.
+
+------------------------------------------------------------
+Identities and delivery settings
+------------------------------------------------------------
+config.local.yaml came across with the zip: the webify_hire_developers
+pitch uses Irshad Memon / Tarannum Khan alternating, forms only.
+Email sending stays OFF (email.enabled: false, no app passwords) - the
+agent fills contact forms and never sends email.
