@@ -13,12 +13,19 @@ def slug(url: str) -> str:
 
 
 class Evidence:
-    def __init__(self, root: str | Path, run_id: str | None = None):
+    def __init__(self, root: str | Path, run_id: str | None = None, screenshots: bool = True):
         self.run_id = run_id or datetime.now().strftime("run_%Y%m%d_%H%M%S")
         self.dir = Path(root) / self.run_id
         self.dir.mkdir(parents=True, exist_ok=True)
+        # When off, shot() is a no-op: the run keeps every other record (status,
+        # detail, the email-body notes) but takes no screenshots. Turned off by
+        # default now that the agent is trusted; pass --screenshots to capture a
+        # run (e.g. a dry run you want to eyeball).
+        self.screenshots = screenshots
 
     async def shot(self, page, row_index: int, url: str, stage: str) -> str:
+        if not self.screenshots:
+            return ""
         name = f"{row_index:04d}_{slug(url)}_{stage}.png"
         path = self.dir / name
         try:
