@@ -8,12 +8,19 @@ from urllib.parse import urlparse
 
 # A site we actually reached. "uncertain" counts: the form was submitted, we
 # just could not read a confirmation - resubmitting would be a second message.
-CONTACTED_STATUSES = {"sent", "success", "uncertain"}
+# "submitted": the form was submitted with no error and no confirmation shown -
+# counted as reached (a real submit happened), kept distinct from "success"
+# (a confirmation was actually seen) so the two can still be told apart.
+CONTACTED_STATUSES = {"sent", "success", "uncertain", "submitted"}
 
 # What is kept per approach in an entry's "touches" list. Deliberately not the
 # whole record: row_index and company_name belong to the sheet, not the touch.
 TOUCH_FIELDS = ("timestamp", "sheet", "script", "follow_up", "method", "status",
                 "detail", "contact_page", "email_used", "sender", "screenshot_after")
+
+# How filler.submit_form's result reads when a submit really was pressed.
+# "no_submit_control" is absent on purpose: nothing was sent that time.
+SUBMIT_PRESSED_RE = re.compile(r"clicked:|requestSubmit\(\)")
 
 
 def norm_site(url: str, scope: str = "host") -> str:
@@ -95,6 +102,7 @@ class State:
         """Indexes of what has actually been contacted, by site and by address."""
         self._sites: dict[str, dict] = {}
         self._emails: dict[str, dict] = {}
+        self._forms: dict[str, dict] = {}
         for url, entry in self.data.items():
             self._index(url, entry)
 
@@ -112,6 +120,18 @@ class State:
         addr = str(entry.get("email_used") or "").strip().lower()
         if addr:
             self._emails[addr] = entry
+        # The site whose contact form actually carried the message. Two listed
+        # websites can end at one company's form - a redirecting domain, or a
+        # group whose pubs all send enquiries to the group's form.
+        for t in (entry.get("touches") or [entry]):
+            if t.get("status") in CONTACTED_STATUSES and t.get("contact_page"):
+                key = norm_site(t["contact_page"], "host")
+                if key:
+                    self._forms.setdefault(key, entry)
+
+    def contacted_via_form(self, page_url: str) -> dict | None:
+        """The earlier record whose message went through a form on this page's site."""
+        return self._forms.get(norm_site(page_url, "host"))
 
     @staticmethod
     def _ever_contacted(entry: dict) -> bool:
@@ -144,6 +164,20 @@ class State:
 
     def get(self, url: str) -> dict | None:
         return self.data.get(url)
+
+    def form_clicked(self, url: str) -> bool:
+        """An earlier attempt pressed this site's submit, yet it reads as not contacted.
+
+        After a press, "failed" is only our reading of the page, and a misread
+        one means the message did arrive: georgianhousehotel.co.uk said "Your
+        submission was successful" and was filed as refused, 2026-09-25.
+        Pressing again would be the double contact the ledger exists to stop.
+        """
+        entry = self.data.get(url)
+        if not entry or self._ever_contacted(entry):
+            return False           # contacted is the duplicate guard's business
+        return any(t.get("method") == "form" and SUBMIT_PRESSED_RE.search(str(t.get("detail", "")))
+                   for t in (entry.get("touches") or [entry]))
 
     def record(self, url: str, result: dict) -> None:
         if self.sheet:

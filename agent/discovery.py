@@ -71,6 +71,11 @@ CAPTCHA_SELECTORS = [
     ".h-captcha",
     ".cf-turnstile",
     "[data-sitekey]",
+    # Contact Form 7 Image CAPTCHA ("Please prove you are human by selecting the
+    # car") - every Clermont hotel, 2026-09-25 - and Really Simple CAPTCHA's
+    # image. Both need a human; clicking on through only earns an error.
+    "text=/prove you('| a)re (a )?human/i",
+    ".wpcf7-captchac",
 ]
 
 # A frame whose URL matches this is a hosted form embed. Such a form is a real
@@ -182,6 +187,8 @@ EXTRACT_FORMS_JS = r"""
         options: tag === 'select'
           ? Array.from(el.options).map(o => ({ value: o.value, text: (o.text || '').trim() })).slice(0, 60)
           : [],
+        // What a select shows now: "" is a "- Please select -" placeholder.
+        value: tag === 'select' ? el.value : '',
       });
     });
 
@@ -207,6 +214,68 @@ EXTRACT_FORMS_JS = r"""
 """
 
 
+# Forms that publish what is typed into them. The pitch posted as a hotel review
+# on ascothydeparkhotel.shop ("Submit review") and hotelkindom.top ("Send
+# review", scored 9/10) on 2026-09-25 - public, and nothing to do with contact.
+# Checked on the form's own id/class and its button, plus field labels that
+# only a review form has, so a contact form whose consent box says "please
+# review our privacy policy" is not caught.
+PUBLISHING_FORM_RE = re.compile(
+    r"\breview|\brating|testimonial|comment-?form|commentform|post comment|"
+    r"leave a (reply|comment)", re.I)
+REVIEW_FIELD_RE = re.compile(
+    r"write (a|your) review|your review|review title|\brating\b|star rating|"
+    r"\bthe (good|bad)\b", re.I)
+
+# Table-booking forms reserve a table: the pitch sent through one arrives as a
+# booking under our name, and a pre-filled date/time can make it go through.
+# Restaurant sites put one on the contact page often enough to matter (checked
+# before the restaurant campaign, 2026-09-25). Told apart by the button
+# ("Book", "Reserve", "Find a table"), by the form calling itself a table
+# booking, or by a date/time field beside a guests/covers/party-size field.
+BOOKING_SUBMIT_RE = re.compile(
+    r"\b(book|reserve|reservation|find\s+a\s+table|check\s+availability|"
+    r"request\s+(a\s+)?booking)\b", re.I)
+BOOKING_FORM_RE = re.compile(
+    r"book(ing)?[\s_-]*(a[\s_-]*)?table|table[\s_-]*(booking|reservation)|"
+    r"opentable|resdiary|sevenrooms|designmynight|quandoo|tablein", re.I)
+# A general contact form never asks how many are coming. "guest" alone does not
+# count: hotel contact forms ask "Are you a current guest?".
+PARTY_SIZE_RE = re.compile(
+    r"\b(guests|covers|party[\s_-]*size|diners|pax|"
+    r"(no\.?|number)[\s_-]*of[\s_-]*(guests|people|covers|diners))\b", re.I)
+PARTY_FIELD_RE = re.compile(r"\b(people|adults|children)\b", re.I)
+DATETIME_FIELD_RE = re.compile(r"\b(date|time|arrival)\b", re.I)
+
+
+# Sign-up forms join a mailing list; with no message box there is nowhere for
+# the pitch to go. sharecommunity.org.uk's "Join our mailing list" (Sign up)
+# was submitted as a contact form, 2026-09-25.
+MAILING_LIST_RE = re.compile(
+    r"mailing[\s_-]*list|newsletter|subscri|sign[\s_-]*up|join[\s_-]*our[\s_-]*(list|mailing)", re.I)
+# A visible box asking the visitor to prove they are human by answering a
+# question. The same form's Drupal "math question (11 + 8 =)" box was taken
+# for the message field and the pitch typed into it. Invisible reCAPTCHA
+# fields are not matched: only a box someone would have to fill in.
+CHALLENGE_FIELD_RE = re.compile(
+    r"captcha|math question|security question|what is \d+\s*[-+x*]\s*\d+|are you (a )?human", re.I)
+
+
+def is_booking_form(form: dict) -> bool:
+    """Every field counts, hidden ones too: booking widgets hide the real
+    date/time inputs behind their own pickers - dishoom.com's group-booking
+    form showed only its guests box, 2026-09-25."""
+    fields = form["fields"]
+    if BOOKING_SUBMIT_RE.search(form["submit_text"]) or BOOKING_FORM_RE.search(
+            form["desc"] + " " + form.get("frame_url", "")):
+        return True
+    if any(PARTY_SIZE_RE.search(f["desc"]) for f in fields):
+        return True
+    has_when = any(f["type"] in ("date", "time", "datetime-local")
+                   or DATETIME_FIELD_RE.search(f["desc"]) for f in fields)
+    return has_when and any(PARTY_FIELD_RE.search(f["desc"]) for f in fields)
+
+
 def score_form(form: dict) -> int:
     """Higher = more likely to be a real contact form. Negative = reject."""
     fields = [f for f in form["fields"] if f["visible"]]
@@ -215,6 +284,16 @@ def score_form(form: dict) -> int:
 
     if "password" in types:
         return -100                      # login / signup
+    if (PUBLISHING_FORM_RE.search(form["desc"] + " " + form["submit_text"])
+            or any(REVIEW_FIELD_RE.search(f["desc"]) for f in fields)):
+        return -100                      # review / comment: it publishes, it doesn't contact
+    if is_booking_form(form):
+        return -100                      # table booking: it reserves, it doesn't contact
+    if "textarea" not in types and MAILING_LIST_RE.search(form["desc"] + " " + form["submit_text"]):
+        return -100                      # mailing-list sign-up: nowhere for a message
+    if any(f["visible"] and f["type"] in ("text", "number", "") and CHALLENGE_FIELD_RE.search(f["desc"])
+           for f in form["fields"]):
+        return -100                      # a question only a human can answer
     if not form["visible"] or not fields:
         return -100
     if any(t in types for t in ("search",)) or re.search(r"\bsearch\b", form["desc"]):
@@ -400,6 +479,69 @@ FORM_READY_GRACE_MS = 350
 IDLE_CEILING_S = 6.0
 
 
+# Cookie banners sit over forms and submit buttons (Cookiebot blocked every
+# Clermont hotel's Submit, 2026-09-25), and the user asked for them to be
+# accepted, 2026-09-29. Known consent tools first, then any banner that calls
+# itself cookie/consent with a plain accept button - never a button elsewhere.
+COOKIE_ACCEPT_SEL = ", ".join([
+    "#onetrust-accept-btn-handler",
+    "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+    "#CybotCookiebotDialogBodyButtonAccept", "#CybotCookiebotDialogBodyLevelButtonAccept",
+    "[data-cky-tag='accept-button']", ".cky-btn-accept",
+    ".cmplz-btn.cmplz-accept", "#cookie_action_close_header", "#cn-accept-cookie",
+    "._brlbs-btn-accept-all", "#didomi-notice-agree-button",
+    "button[data-testid='uc-accept-all-button']", "#truste-consent-button",
+    "[data-tid='banner-accept']", ".osano-cm-accept-all", ".iubenda-cs-accept-btn",
+    ".qc-cmp2-summary-buttons button[mode='primary']", "#ccc-recommended-settings",
+    "#wt-cli-accept-all-btn", "#wt-cli-accept-btn", ".moove-gdpr-infobar-allow-all",
+    ".cc-allow", ".cc-accept", "#accept-cookies", "#acceptCookies", ".js-cookie-accept",
+])
+COOKIE_BANNER_JS = r"""() => {
+  const words = /^(accept( all)?( cookies)?|allow( all)?( cookies)?|i accept|accept (&|and) close|agree( (&|and) close)?|i agree|got it|ok(ay)?)$/i;
+  const bannerish = /cookie|consent|gdpr|\bcmp\b|cc-window|cookiebar/i;
+  for (const b of document.querySelectorAll('button, [role=button], a.button, input[type=button], input[type=submit]')) {
+    const t = (b.innerText || b.value || '').trim();
+    if (!t || t.length > 40 || !words.test(t)) continue;
+    let el = b, hit = false;
+    for (let i = 0; i < 8 && el && el.getAttribute; i++, el = el.parentElement) {
+      const sig = (el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '') + ' ' + (el.getAttribute('aria-label') || '');
+      if (bannerish.test(sig)) { hit = true; break; }
+    }
+    const r = b.getBoundingClientRect();
+    if (!hit || !r.width || !r.height) continue;
+    b.click(); return t;
+  }
+  return '';
+}"""
+
+
+async def accept_cookies(page) -> str:
+    """Click a showing cookie banner's accept button. Never raises."""
+    targets = [page]
+    try:
+        targets += [f for f in page.frames if f is not page.main_frame
+                    and re.search(r"consent|cookie|cmp|sp_message|privacy", f.url or "", re.I)]
+    except Exception:
+        pass
+    for target in targets:
+        try:
+            loc = target.locator(COOKIE_ACCEPT_SEL).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=2500)
+                await asyncio.sleep(0.4)
+                return "consent tool"
+        except Exception:
+            pass
+        try:
+            text = await asyncio.wait_for(target.evaluate(COOKIE_BANNER_JS), timeout=EVAL_TIMEOUT_S)
+            if text:
+                await asyncio.sleep(0.4)
+                return f"banner: {text}"
+        except Exception:
+            pass
+    return ""
+
+
 async def settle(page, extra_ms: int = 1800, adaptive: bool = True) -> None:
     """Wait until the page has something worth reading.
 
@@ -422,6 +564,7 @@ async def settle(page, extra_ms: int = 1800, adaptive: bool = True) -> None:
             await page.wait_for_timeout(extra_ms)
         except Exception:
             pass
+        await accept_cookies(page)
         return
 
     form = asyncio.ensure_future(
@@ -460,6 +603,7 @@ async def settle(page, extra_ms: int = 1800, adaptive: bool = True) -> None:
         await page.wait_for_timeout(FORM_READY_GRACE_MS if ready else extra_ms)
     except Exception:
         pass
+    await accept_cookies(page)
 
 
 async def harvest_emails(page, host: str, candidates: list[str], timeout: int,

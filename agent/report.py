@@ -12,11 +12,17 @@ from string import Template
 
 STATUS_META = {
     # key: (label, role)  - role picks the color from the fixed status palette
-    "success": ("Success", "good"),
-    "sent": ("Sent", "good"),
+    "success": ("Success - confirmation seen", "good"),
+    "submitted": ("Submitted - no confirmation", "good"),
+    "sent": ("Sent (email)", "good"),
     "uncertain": ("Uncertain", "warning"),
-    "failed": ("Failed", "serious"),
+    "failed": ("Failed - form error", "serious"),
     "no_contact_found": ("No contact found", "serious"),
+    "skipped_no_email": ("No usable form - not contacted", "neutral"),
+    "skipped_duplicate": ("Already contacted", "neutral"),
+    "skipped_blocked": ("Skipped - blocklisted", "neutral"),
+    "captcha_after_submit": ("Blocked by CAPTCHA", "serious"),
+    "timeout": ("Timed out", "critical"),
     "unreachable": ("Unreachable", "critical"),
     "error": ("Error", "critical"),
     "dry_run": ("Dry run", "neutral"),

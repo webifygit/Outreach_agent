@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import os
+import csv
 import random
 import re
 import shutil
@@ -95,6 +96,110 @@ async def host_resolves(url: str, timeout: float = 3.0) -> bool:
         return False
     except Exception:  # noqa: BLE001
         return True
+
+
+def _url_variants(url: str) -> list[str]:
+    """Other spellings of a URL worth trying in the browser before a site is
+    called dead: toggle the www. prefix, and fall back to http. The original
+    URL is tried by the caller first, so it is not repeated here."""
+    try:
+        p = urlparse(url if "://" in url else f"https://{url}")
+    except ValueError:
+        return []
+    host = p.hostname or ""
+    if not host:
+        return []
+    path = p.path or "/"
+    alt_host = host[4:] if host.startswith("www.") else f"www.{host}"
+    return [f"https://{alt_host}{path}", f"http://{host}{path}"]
+
+
+# A run appends sites a person has to finish - CAPTCHA/Cloudflare, or a required
+# field with no honest answer - to this queue, one row per company, so none is
+# lost just because the agent could not finish it on its own.
+_HUMAN_QUEUE_RE = re.compile(r"captcha|turnstile|cloudflare", re.I)
+_HUMAN_QUEUE_FIELDS = ["timestamp", "host", "website", "company_name",
+                       "contact_page", "script", "reason", "detail"]
+
+
+def queue_for_human(cfg, result: dict) -> None:
+    """Record a site that needs a person. Deduplicated by host - once a company
+    is on the list it is not added again, however many of its pages we see."""
+    reasons = []
+    if result.get("needs_human"):
+        reasons.append("a required field has no honest answer")
+    detail = str(result.get("detail") or "")
+    if _HUMAN_QUEUE_RE.search(detail):
+        reasons.append("CAPTCHA / Cloudflare")
+    if not reasons:
+        return
+    path = Path(cfg.resolve(cfg.path("paths", "human_queue_path",
+                                     default="output/human_queue.csv")))
+    host = norm_site(result.get("website", ""), "host")
+    if not host:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        with open(path, newline="", encoding="utf-8") as fh:
+            if any(r.get("host") == host for r in csv.DictReader(fh)):
+                return
+    new = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=_HUMAN_QUEUE_FIELDS, extrasaction="ignore")
+        if new:
+            w.writeheader()
+        w.writerow({"timestamp": result.get("timestamp", ""), "host": host,
+                    "website": result.get("website", ""),
+                    "company_name": result.get("company_name", ""),
+                    "contact_page": result.get("contact_page", ""),
+                    "script": result.get("script", ""),
+                    "reason": "; ".join(reasons), "detail": detail[:200]})
+
+
+class NetworkDown(Exception):
+    """This machine is offline - a verdict on us, not on the site.
+
+    A Mac that dozes on battery wakes for a few seconds every ~15 minutes
+    with no network. Every site tried in that window failed its DNS lookup
+    and was filed as unreachable for good: 135 of 296 such dental-sheet rows
+    resolved fine afterwards, 2026-10-26. Raised instead of recording, so the
+    row goes back on the queue.
+    """
+
+
+# Hosts that are always up. If none of them resolves either, the lookup that
+# just failed says nothing about the site.
+_PROBE_HOSTS = ("www.google.com", "www.cloudflare.com", "www.apple.com")
+
+
+async def network_up(timeout: float = 5.0) -> bool:
+    loop = asyncio.get_running_loop()
+    for host in _PROBE_HOSTS:
+        try:
+            await asyncio.wait_for(loop.getaddrinfo(host, None), timeout)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def keep_awake(logfile=None) -> None:
+    """Stop macOS idle-sleeping for as long as this process lives.
+
+    On battery this Mac sleeps after a minute idle, which froze the dental
+    run for ~40 of its first 69 hours. caffeinate -w exits by itself when we
+    do, so a watchdog kill or a supervisor restart cannot leave it behind.
+    -s (stay awake on AC even with the lid shut) is ignored on battery.
+    """
+    exe = shutil.which("caffeinate")
+    if not exe:
+        return          # not a Mac - nothing to do
+    try:
+        subprocess.Popen([exe, "-i", "-s", "-w", str(os.getpid())],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("keeping the Mac awake while this run lasts (caffeinate)", logfile)
+    except OSError as exc:
+        log(f"could not start caffeinate ({exc}) - the Mac may sleep mid-run", logfile)
 
 
 async def open_page(context, url: str, timeout: int, retries: int):
@@ -192,7 +297,19 @@ async def locate_form(page, cfg, timeout: int, retries: int, context,
 # set of driver children that appeared while it was starting, and concurrent
 # launches make that ambiguous. Launches are rare (startup, recycle, relaunch)
 # and take about a second, so the contention costs nothing.
-_LAUNCH_LOCK = asyncio.Lock()
+#
+# Made on first use, inside the running loop: on Python 3.9 a Lock created at
+# import binds to a different loop than asyncio.run's, and every worker that
+# had to wait for it died with "attached to a different loop" instead - 122
+# failed browser starts, and a 4th worker that never ran, by 2026-10-26.
+_LAUNCH_LOCK: asyncio.Lock | None = None
+
+
+def _launch_lock() -> asyncio.Lock:
+    global _LAUNCH_LOCK
+    if _LAUNCH_LOCK is None:
+        _LAUNCH_LOCK = asyncio.Lock()
+    return _LAUNCH_LOCK
 
 
 def _driver_pid(pw) -> int:
@@ -245,7 +362,7 @@ async def open_browser(pw, cfg, old_browser=None):
     channel = str(cfg.path("run", "browser_channel", default="") or "").strip()
     if channel:
         launch["channel"] = channel
-    async with _LAUNCH_LOCK:
+    async with _launch_lock():
         drv = _driver_pid(pw)
         before = _child_pids(drv)
         try:
@@ -300,6 +417,11 @@ def _embed_label(form: dict) -> str:
     return host or "same-origin iframe"
 
 
+# Contact-form sites claimed in this run, so two sites of one company that are
+# worked on at the same time cannot both send.
+_FORM_SITES_THIS_RUN: set[str] = set()
+
+
 async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None):
     url = row["website"]
     idx = row["row_index"]
@@ -322,15 +444,37 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
     # happen on pages that have already proved they load.
     nav_timeout = int(cfg.path("run", "nav_timeout_ms", default=0) or timeout)
 
-    if not await host_resolves(url):
+    # By default a domain with no DNS record is written off without a browser
+    # attempt - on big lists that is a quarter of the rows, and asking the
+    # browser costs up to 34s to learn what a lookup settles in milliseconds.
+    # With run.verify_dead_in_browser on, nothing is skipped on the lookup
+    # alone: every URL is actually opened, and only a browser failure (plus the
+    # www./http variants a person would try) marks it unreachable.
+    verify_in_browser = bool(cfg.path("run", "verify_dead_in_browser", default=False))
+    if not verify_in_browser and not await host_resolves(url):
+        if not await network_up():
+            raise NetworkDown("DNS lookup failed, and so did well-known hosts")
         result.update(method="none", status="unreachable",
                       detail="domain does not resolve (DNS) - no browser attempt made")
         return result
 
     page, err = await open_page(context, url, nav_timeout, retries)
+    if err and verify_in_browser:
+        for alt in _url_variants(url):
+            try:
+                await page.close()
+            except Exception:
+                pass
+            page, err = await open_page(context, alt, nav_timeout, retries)
+            if not err:
+                result["detail"] += f"opened via {alt} (original spelling failed). "
+                break
     if err:
-        result.update(method="none", status="unreachable", detail=err)
         await page.close()
+        if not await network_up():
+            raise NetworkDown(err)
+        result.update(method="none", status="unreachable",
+                      detail=f"could not open the site in a browser ({err})")
         return result
 
     # A name split off the domain runs the words together
@@ -364,13 +508,42 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
                                                   contact_candidates, deadline)
     result["contact_page"] = contact_url
 
+    # One company, one message. The site guard compares the listed address,
+    # but two listed websites can end at the same contact form: a redirecting
+    # domain (churchillretirement.co.uk -> churchill-living.co.uk) or a group
+    # whose sites all use the group's form - 17 Urban Pubs & Bars pubs each got
+    # the pitch through urbanpubsandbars.com's one form, 2026-09-29.
+    if state is not None and not cfg.get("_follow_up"):
+        form_site = norm_site(contact_url or page.url, "host")
+        prior = state.contacted_via_form(contact_url or page.url)
+        if form_site and (prior or form_site in _FORM_SITES_THIS_RUN):
+            when = str((prior or {}).get("timestamp", ""))[:10] or "earlier in this run"
+            result.update(method="none", status="skipped_duplicate",
+                          detail=f"this company's contact form on {form_site} was already used "
+                                 f"({when}) - one message per company")
+            await page.close()
+            return result
+        _FORM_SITES_THIS_RUN.add(form_site)
+
     top_score, top_form, top_frame = (ranked[0] if ranked else (-999, None, None))
     captcha = await discovery.has_captcha(page, top_frame)
 
     use_form = top_form is not None and top_score >= 40
     if use_form and captcha and cfg.path("form", "skip_if_captcha", default=True):
         use_form = False
-        result["detail"] = f"CAPTCHA present ({captcha}) - falling back to email. "
+        result["needs_human"] = True
+        result["detail"] = (f"CAPTCHA present ({captcha}) - the agent does not answer these; "
+                            f"queued for a person to finish. ")
+
+    # One press of a site's submit per campaign, whatever we made of the page
+    # afterwards (State.form_clicked). A retry or resume would otherwise send
+    # a second message wherever the first was misread as refused. Email can
+    # still pick the row up; follow-ups are meant to write again.
+    if (use_form and state is not None and not cfg.get("_follow_up")
+            and state.form_clicked(url)):
+        use_form = False
+        result["detail"] += ("form already submitted in an earlier attempt - "
+                             "not pressing submit a second time. ")
 
     # A form with nowhere to put the message can only deliver a name and an
     # email address - the recipient gets an enquiry that says nothing. The
@@ -396,6 +569,11 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
                 result["detail"] += (
                     f"already approached {str(prior_touch.get('timestamp', ''))[:10]} - "
                     "not sending a second enquiry that carries no message. ")
+            elif not prior_touch and not cfg.path("form", "messageless_on_first_touch", default=True):
+                # A hand-written opener is the whole point of a targeted list;
+                # a demo-request form that drops it is a fake lead, not a pitch.
+                result["detail"] += ("message-less forms are off for this run "
+                                     "(form.messageless_on_first_touch: false). ")
             else:
                 spare_form_url = contact_url or page.url
 
@@ -407,6 +585,12 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
         report = await filler.fill_form(frame, form, cfg, ctx, env, subject)
         result["screenshot_before"] = await ev.shot(page, idx, url, "01_filled")
 
+        if report.get("needs_human"):
+            # A required dropdown/radio with no honest answer (truthful_only).
+            # Flag it so the row is routed to the human queue rather than sent
+            # with a made-up reply.
+            result["needs_human"] = True
+            result["detail"] += f"needs a person - no honest answer for: {report['needs_human']}. "
         if report["missing_required"]:
             result["detail"] += f"unmapped required fields: {report['missing_required']}. "
 
@@ -449,6 +633,15 @@ async def process(row, context, cfg, env, mailer, ev, args, logfile, state=None)
         if status == "success" and strength != "strong" and report["missing_required"]:
             status = "uncertain"
             detail += " - but required fields were left unmapped"
+        # Point 7: a form that was actually submitted with no error counts as a
+        # reach even when the site shows no thank-you. "uncertain" here always
+        # follows a real submit press (a refused/failed submit returns "failed"
+        # above), so it is promoted to "submitted". A validation error never
+        # reaches this line, so a form that did not go through is never counted.
+        if (status == "uncertain" and not click.startswith("no_submit_control")
+                and cfg.path("form", "count_submitted_as_success", default=False)):
+            status = "submitted"
+            detail = "submitted, no error (no confirmation shown) - " + detail
         result["status"] = status
         result["detail"] += f"{click}; {detail}"
         return status != "failed"
@@ -555,6 +748,34 @@ class RunLock:
     def __init__(self, path):
         self.path = Path(path)
 
+    def held_by(self) -> int:
+        """Pid of another live run.py holding this lock, or 0.
+
+        Two live runs share one sheet in the same order and each trusts only
+        its own copy of state, so every site gets submitted twice: a stop and
+        resume racing the console's restart did exactly that to 11 clinics,
+        2026-10-26. A lock left by a killed run names a dead pid, or one
+        reused by something that is not run.py, and does not count.
+        """
+        try:
+            pid = int(self.path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return 0
+        if pid == os.getpid():
+            return 0
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return 0
+        except PermissionError:
+            pass
+        try:
+            cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return pid      # cannot tell - assume it is a run, not a double send
+        return pid if "run.py" in cmd else 0
+
     def __enter__(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -599,9 +820,18 @@ async def main_async(args) -> int:
         cfg["run"]["mode"] = "live"
     if args.no_headless:
         cfg["run"]["headless"] = False
+    if args.screenshots:
+        cfg["run"]["screenshots"] = True
 
     logfile = cfg.resolve(cfg.path("paths", "log_path", default="output/run.log"))
     logfile.parent.mkdir(parents=True, exist_ok=True)
+
+    other = RunLock(cfg.resolve(cfg.path("paths", "lock_path",
+                                         default="output/run.lock"))).held_by()
+    if other:
+        log(f"REFUSING to start: another run is already going (pid {other}). Two runs "
+            f"would contact every site twice. Stop it first.", logfile)
+        return 2
 
     # Which pitch this sheet gets. Applied before any template path is read,
     # and fatal if unknown - the wrong pitch reaching a targeted sheet cannot
@@ -765,11 +995,15 @@ async def main_async(args) -> int:
         # "already attempted" here is a touch from this run, i.e. one written
         # since the process started.
         if cfg.get("_follow_up"):
-            cutoff = run_started.isoformat(timespec="seconds")
+            # A follow-up's own touches mark what is done: any touch carrying
+            # this script key, whenever it was written. "Since this process
+            # started" restarted a watchdog-relaunched batch from row 1 and sent
+            # 12 restaurants their follow-up twice, 2026-10-01.
             seen_hosts = {norm_site(u, scope) for u, e in state.data.items()
-                          if str(e.get("timestamp", "")) >= cutoff}
-            log(f"continuing a follow-up batch: counting only touches since {cutoff}",
-                logfile)
+                          if any(t.get("script") == script_key
+                                 for t in (e.get("touches") or [e]))}
+            log(f"continuing a follow-up batch: {len(seen_hosts)} site(s) already have "
+                f"'{script_key}'", logfile)
         else:
             seen_hosts = {norm_site(u, scope) for u in state.data}
         pending = [r for r in rows if norm_site(r["website"], scope) not in seen_hosts]
@@ -794,7 +1028,11 @@ async def main_async(args) -> int:
         log(f"WARNING (email fallback): {warn}", logfile)
 
     env = make_env(cfg["_root"])
-    ev = Evidence(cfg.resolve(cfg.path("paths", "evidence_dir", default="evidence")))
+    # Screenshots default off now the agent is trusted; --screenshots (or
+    # run.screenshots: true) turns them on for a run you want to eyeball.
+    shots_on = bool(cfg.path("run", "screenshots", default=True))
+    ev = Evidence(cfg.resolve(cfg.path("paths", "evidence_dir", default="evidence")),
+                  screenshots=shots_on)
 
     mode = "LIVE - forms will be submitted and email sent" if cfg.live else "DRY RUN - nothing sent"
     log(f"{mode} | {len(rows)} sites | evidence -> {ev.dir}", logfile)
@@ -805,6 +1043,7 @@ async def main_async(args) -> int:
 
     run_lock = RunLock(cfg.resolve(cfg.path("paths", "lock_path", default="output/run.lock")))
     run_lock.__enter__()
+    keep_awake(logfile)
 
     results: list[dict] = []
     daily_cap = int(cfg.path("email", "daily_limit", default=50))
@@ -932,6 +1171,7 @@ async def main_async(args) -> int:
                     log(f"{tag}[{n}/{len(rows)}] {row['website']}", logfile)
                     beats[wid].update(at=time.time(), site=row["website"])
                     res = None
+                    offline = False
                     for attempt in (1, 2):
                         if not browser.is_connected():
                             log(f"{tag}    browser is not connected - relaunching", logfile)
@@ -952,6 +1192,9 @@ async def main_async(args) -> int:
                             res = _row_result(row, "timeout",
                                               f"site exceeded run.site_timeout_s ({site_timeout:.0f}s) - skipped")
                             await _close_stray_pages(context)
+                            break
+                        except NetworkDown:
+                            offline = True
                             break
                         except Exception as exc:  # noqa: BLE001
                             if beats[wid].get("killed"):
@@ -979,6 +1222,29 @@ async def main_async(args) -> int:
                             res = _row_result(row, "error", f"{type(exc).__name__}: {str(exc)[:200]}")
                             break
 
+                    if offline:
+                        # Nothing was recorded for this row, so it is simply
+                        # tried again once we are back online. The beats keep
+                        # both watchdogs from mistaking the wait for a wedge,
+                        # and the log line every minute keeps the console's
+                        # stall watch from restarting the run.
+                        queue.put_nowait((n, row))
+                        await _close_stray_pages(context)
+                        waited = 0
+                        while not await network_up():
+                            if waited % 60 == 0:
+                                log(f"{tag}network is down - {row['website']} goes back on the "
+                                    f"queue; waiting for the connection before trying more sites",
+                                    logfile)
+                            await asyncio.sleep(15)
+                            waited += 15
+                            heartbeat["at"] = time.time()
+                            beats[wid].update(at=time.time(), site="")
+                        log(f"{tag}network is back after {waited}s - carrying on", logfile)
+                        heartbeat["at"] = time.time()
+                        beats[wid].update(at=time.time(), site="")
+                        continue
+
                     # Everything from here to the end of the loop body runs
                     # without an await, so another worker cannot interleave
                     # part-way through and corrupt the state file or the counts.
@@ -992,6 +1258,10 @@ async def main_async(args) -> int:
                     res["follow_up"] = bool(cfg.get("_follow_up"))
                     results.append(res)
                     state.record(row["website"], res)
+                    # Sites the agent could not finish on its own (CAPTCHA /
+                    # Cloudflare, or a required field with no honest answer) go
+                    # on the human queue so a person can complete them.
+                    queue_for_human(cfg, res)
                     since_recycle += 1
                     done_count += 1
                     log(f"{tag}    -> {res['method'] or '-'} / {res['status']} "
@@ -1108,6 +1378,8 @@ def parse_args(argv=None):
     p.add_argument("--live", action="store_true", help="actually submit forms and send email")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--no-headless", action="store_true", help="show the browser window")
+    p.add_argument("--screenshots", action="store_true",
+                   help="capture before/after screenshots this run (off by default)")
     p.add_argument("--no-resume", action="store_true", help="reprocess rows already done")
     p.add_argument("--continue-batch", action="store_true",
                    help="carry on where a stopped run left off: skip every row already "

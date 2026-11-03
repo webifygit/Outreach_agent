@@ -31,6 +31,9 @@ ROLE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("last_name", re.compile(r"last[ _-]?name|lname|surname|family[ _-]?name|\blast\b")),
     # Before "subject" on purpose: that pattern matches "title", so a Job Title
     # box used to be handed the subject line instead of the sender's role.
+    # Before subject/message: "How did you hear about us?" is not the enquiry.
+    ("heard_about", re.compile(r"hear(d)? about|how did you (hear|find|learn)|find us|"
+                               r"where did you (hear|find|see)|referr(al|ed)|lead ?source|\bsource\b")),
     ("designation", re.compile(r"designation|job ?title|your ?title|position|"
                                r"role|occupation|job ?role")),
     ("subject",   re.compile(r"subject|regarding|topic|reason|enquiry ?type|inquiry ?type|title")),
@@ -61,8 +64,13 @@ SUBMIT_SELECTORS = [
     "button",
 ]
 
+# "was successful" as well as "successfully": georgianhousehotel.co.uk says
+# "Your submission was successful." and was scored a failure, 2026-09-25.
+# ...and "NO, THANKS" is a pop-up's dismiss button, not a confirmation - it
+# scored crowngroupofhotels.com a success off a newsletter offer, 2026-09-25.
 SUCCESS_TEXT_RE = re.compile(
-    r"thank(s| you)|we('| ha)?ve received|message (has been )?sent|successfully|"
+    r"(?<!no, )(?<!no,)(?<!no )thank(s| you)|we('| ha)?ve received|message (has been )?sent|successfully|"
+    r"(was|has been) successful|"
     r"submission received|we'?ll (get back|be in touch)|form submitted|"
     r"your (message|enquiry|inquiry|request) has been",
     re.I,
@@ -70,18 +78,75 @@ SUCCESS_TEXT_RE = re.compile(
 
 ERROR_TEXT_RE = re.compile(
     r"(is )?required|please (enter|fill|select|complete)|invalid|"
-    r"something went wrong|could not be sent|try again",
+    r"something went wrong|could not be sent|try again|"
+    r"fields? (have|has) an error",
     re.I,
 )
 
 CONSENT_RE = re.compile(
-    r"consent|agree|privacy|terms|policy|gdpr|permission|authori[sz]e|i accept", re.I
+    r"consent|agree|privacy|terms|policy|gdpr|permission|authori[sz]e|accept|"
+    r"condition|acknowledg|i have read|i confirm", re.I
 )
 MARKETING_OPTIN_RE = re.compile(r"newsletter|subscribe|marketing|updates|promotion", re.I)
 
+# Tick-box and radio groups asking what the enquiry is about, or how to reply:
+# take the general option and email - never one that books, subscribes,
+# applies or complains. Asked for so a person only has the CAPTCHA left to do
+# (care homes, 2026-09-29): "What are you looking for? Book a visit / Request a
+# brochure / General enquiry / Contact us" was being left for them to tick.
+GENERAL_OPTION_RE = re.compile(r"general|enquir|inquir|contact us|question|information|something else", re.I)
+AVOID_OPTION_RE = re.compile(
+    r"book|visit|tour|brochure|viewing|appointment|call ?back|newsletter|subscri|marketing|"
+    r"\bjobs?\b|career|vacanc|recruit|complain|feedback|admission|respite|\bfees?\b|price|quote|"
+    r"\bother\b|please specify|updates|offers", re.I)
+CONTACT_PREF_RE = re.compile(r"e-?mail|phone|telephone|\bcall\b|\btext\b|\bsms\b|post", re.I)
+# "Are you a resident / family member / professional?" - Pest Stop is a business.
+BUSINESS_OPTION_RE = re.compile(r"professional|business|supplier|company|trade|organi[sz]ation|partner|commercial|contractor", re.I)
+CONTACT_ME_RE = re.compile(r"(contact|reply to|respond to|get back to|call) me|you (may|can) contact me", re.I)
+
+
+def _option_text(field: dict) -> str:
+    """An option's own words: its desc without the name the whole group shares."""
+    name = (field.get("name") or "").lower()
+    return field["desc"].replace(name, " ") if name else field["desc"]
+
 # Options that ask for more than a click - "other" usually reveals a text box
 # that is then required, and an opt-in is not ours to accept.
-SKIP_OPTION_RE = re.compile(r"other|please specify|newsletter|subscribe|marketing", re.I)
+# (\b here was typed as literal backspaces since 2026-08-29, so "other" never matched.)
+SKIP_OPTION_RE = re.compile(r"\bother\b|please specify|newsletter|subscribe|marketing", re.I)
+
+# An unmapped select left on its "- Please select -" placeholder is chosen for
+# when its label says it routes the enquiry. staygenerator.com rejected the
+# form over "Who should we send your enquiry to?", enforced by script rather
+# than the required attribute, 2026-09-25. Optional-looking selects stay put:
+# choosing one can reveal further required fields.
+ROUTING_SELECT_RE = re.compile(
+    r"\*|required|enquir|inquir|department|who should|send (it|this|your|us|to)|"
+    r"recipient|nature of|reason|topic|regarding|hotel|property|venue", re.I)
+# The team a pest-control offer is for, when the select lets us say so.
+PREFERRED_OPTION_RE = re.compile(
+    r"general|facilit|maintenance|operations|management|procure|purchas|supplier|head office",
+    re.I)
+
+
+def truthful_option(field: dict) -> dict | None:
+    """An option we can honestly choose for a select we did not map to a role.
+
+    Only a general-enquiry or business-contact option is true of us. A service
+    form's "What pest problem do you have?" or "Preferred appointment date" has
+    no honest answer, because we are not a customer booking a job - so this
+    returns None and the caller leaves the field for a person rather than
+    inventing a reply that lands a fake service request in someone's queue.
+    """
+    opts = [o for o in field.get("options", []) if o.get("value") and o["value"] not in {"0", "-1"}]
+    for rx in (PREFERRED_OPTION_RE, GENERAL_OPTION_RE, BUSINESS_OPTION_RE):
+        pick = next((o for o in opts
+                     if rx.search(o.get("text") or "")
+                     and not AVOID_OPTION_RE.search(o.get("text") or "")
+                     and not SKIP_OPTION_RE.search(o.get("text") or "")), None)
+        if pick:
+            return pick
+    return None
 
 
 def fillable(field: dict) -> bool:
@@ -178,8 +243,14 @@ def render_tiered_message(env, cfg, ctx: dict, maxlength: int | None) -> str:
         if len(text) <= maxlength:
             return text
 
-    shortest = rendered[-1]
-    return shortest[:maxlength].rsplit(" ", 1)[0].rstrip(",.;: ")
+    # Even the shortest tier is too long: trim it, but end on a whole sentence
+    # where one falls reasonably near the limit, and otherwise on a whole word -
+    # so a cut message never stops mid-phrase.
+    clipped = rendered[-1][:maxlength]
+    sentence_end = max(clipped.rfind(". "), clipped.rfind("! "), clipped.rfind("? "))
+    if sentence_end >= maxlength * 0.6:
+        return clipped[:sentence_end + 1]
+    return clipped.rsplit(" ", 1)[0].rstrip(",.;: ")
 
 
 def _address_line(s: dict) -> str:
@@ -212,6 +283,8 @@ def values_for(cfg, ctx: dict, message: str, subject: str) -> dict[str, str]:
         "city": s.get("city", ""),
         "state": s.get("state", ""),
         "designation": s.get("designation", ""),
+        # How these businesses were found: a Google (Maps) search.
+        "heard_about": s.get("heard_about", "Google search"),
         "country": s.get("country", ""),
         # A required zip field left blank fails the whole submission - and it is
         # required far more often than it looks, especially on US service sites
@@ -248,6 +321,34 @@ SET_VALUE_JS = """(el, value) => {
   el.dispatchEvent(new Event('change', {bubbles: true}));
   return el.value;
 }"""
+
+
+# HTMLElement.click() works on a checkbox or radio that is styled out of sight
+# (opacity 0, 0x0, under a label) and fires the input/change events a site
+# listens for. Never un-ticks: an already checked box is left alone.
+TICK_JS = """(el) => {
+  if (!el.checked) el.click();
+  if (!el.checked) {
+    el.checked = true;
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  }
+  return el.checked;
+}"""
+
+
+async def _tick(frame, sel: str, visible: bool) -> bool:
+    """Tick a checkbox or radio - a real click when it can be seen."""
+    if visible:
+        try:
+            await frame.check(sel, timeout=4000)
+            return True
+        except Exception:
+            pass
+    try:
+        return bool(await frame.eval_on_selector(sel, TICK_JS))
+    except Exception:
+        return False
 
 
 async def _set_value(frame, sel: str, value: str, is_select: bool) -> bool:
@@ -298,6 +399,16 @@ INVALID_FIELDS_JS = r"""(form) => {
 }"""
 
 
+# Text boxes that hold a value and still fail validation - the site's own
+# check has not caught up with a value that arrived without keystrokes.
+INVALID_WITH_VALUE_JS = r"""(form) => Array.from(form.elements).filter((el) => {
+  if (!el.willValidate || el.checkValidity() || !el.getAttribute('data-agent-id')) return false;
+  const typed = el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' &&
+    !['checkbox', 'radio', 'file', 'hidden', 'range', 'color'].includes(el.type));
+  return typed && (el.value || '').trim() !== '';
+}).map((el) => el.getAttribute('data-agent-id'))"""
+
+
 async def invalid_fields(frame, form_key: str) -> list[str]:
     """Fields the browser will refuse to submit, as "label (why)" strings."""
     try:
@@ -329,6 +440,11 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
 
     filled: dict[str, str] = {}
     missing_required: list[str] = []
+    # Fields a person must finish because we have no honest value for them.
+    # Collected (not fabricated) when truthful_only is on, so the row can be
+    # routed to the human queue instead of submitting a made-up answer.
+    needs_human: list[str] = []
+    truthful_only = bool(cfg.path("form", "truthful_only", default=False))
 
     for role, field in roles.items():
         value = values.get(role, "")
@@ -346,58 +462,126 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
         except Exception as exc:  # noqa: BLE001
             filled[role] = f"FAILED: {type(exc).__name__}"
 
-    # Selects we did not map but which are required - pick the first real option.
+    # Selects we did not map but which need an answer: required ones, and ones
+    # left on a blank placeholder whose label says they route the enquiry.
+    # Prefer the team a pest-control offer is for, never "Other" (it usually
+    # opens a required text box), else the first real option.
     for field in form["fields"]:
-        if field["tag"] != "select" or not fillable(field) or not field["required"]:
+        if field["tag"] != "select" or not fillable(field):
             continue
         if any(f is field for f in roles.values()):
             continue
+        routing = (field["visible"] and field.get("value") == ""
+                   and ROUTING_SELECT_RE.search(field["desc"] or ""))
+        if not (field["required"] or routing):
+            continue
         try:
             opts = [o for o in field["options"] if o["value"] and o["value"] not in {"0", "-1"}]
-            if opts:
+            if truthful_only:
+                # Never fall back to "the first real option": that is how a
+                # service form's pest-type or date dropdown got a false answer.
+                pick = truthful_option(field)
+                if not pick:
+                    missing_required.append(f"dropdown needs a person: {(field['desc'] or 'select')[:50]}")
+                    needs_human.append(f"dropdown: {(field['desc'] or 'select')[:50]}")
+                    continue
+            else:
+                pick = (next((o for o in opts if PREFERRED_OPTION_RE.search(o["text"])), None)
+                        or next((o for o in opts if not SKIP_OPTION_RE.search(o["text"])), None)
+                        or (opts[0] if opts else None))
+            if pick:
                 sel = f"[data-agent-id='{field['agent_id']}']"
-                if await _set_value(frame, sel, opts[0]["value"], is_select=True):
-                    filled[f"select:{(field['desc'] or '')[:24]}"] = opts[0]["text"][:40]
+                if await _set_value(frame, sel, pick["value"], is_select=True):
+                    filled[f"select:{(field['desc'] or '')[:24]}"] = pick["text"][:40]
         except Exception:
             pass
 
-    # Consent checkboxes: tick required ones, never tick marketing opt-ins.
+    # Consent checkboxes: tick required ones, never tick marketing opt-ins. A
+    # custom-styled box keeps its real input out of sight, so a hidden one is
+    # ticked too when it is required or says it is consent - the one on
+    # hotel-lancaster-hydepark.com ("I accept that the form entries are checked
+    # for spam") was skipped as invisible and the form refused, 2026-09-25. A
+    # hidden, unlabelled, optional checkbox is still left alone: a honeypot.
     if cfg.path("form", "accept_consent_checkboxes", default=True):
         for field in form["fields"]:
-            if field["type"] != "checkbox" or not field["visible"]:
+            if field["type"] != "checkbox" or field.get("checked"):
                 continue
             if MARKETING_OPTIN_RE.search(field["desc"]):
                 continue
             if field["required"] or CONSENT_RE.search(field["desc"]):
-                try:
-                    await frame.check(f"[data-agent-id='{field['agent_id']}']", timeout=4000)
-                except Exception:
-                    pass
+                sel = f"[data-agent-id='{field['agent_id']}']"
+                if await _tick(frame, sel, field["visible"]):
+                    filled[f"tick:{field['desc'][:24]}"] = "checked"
+
+    # Enquiry-type and reply-method groups, required or not.
+    picked_groups: set[str] = set()
+    choice_groups: dict[str, list[dict]] = {}
+    for field in form["fields"]:
+        if field["type"] in ("checkbox", "radio") and fillable(field):
+            choice_groups.setdefault(field.get("name") or field["agent_id"], []).append(field)
+    for name, options in choice_groups.items():
+        if any(o.get("checked") for o in options):
+            continue
+        texts = [(o, _option_text(o)) for o in options]
+        if len(options) == 1:
+            o, t = texts[0]
+            if CONTACT_ME_RE.search(t) and not MARKETING_OPTIN_RE.search(t):
+                if await _tick(frame, f"[data-agent-id='{o['agent_id']}']", o["visible"]):
+                    filled[f"tick:{t.strip()[:24]}"] = "checked"
+            continue
+        if all(CONSENT_RE.search(t) or MARKETING_OPTIN_RE.search(t) for _, t in texts):
+            continue                       # consent and opt-ins have their own rule
+        pick = next((o for o, t in texts if GENERAL_OPTION_RE.search(t)
+                     and not AVOID_OPTION_RE.search(t)), None)
+        if pick is None:
+            pick = next((o for o, t in texts if BUSINESS_OPTION_RE.search(t)
+                         and not AVOID_OPTION_RE.search(t)), None)
+        if pick is None and all(CONTACT_PREF_RE.search(t) for _, t in texts):
+            pick = next((o for o, t in texts if re.search(r"e-?mail", t)), None)
+        if pick is not None and await _tick(frame, f"[data-agent-id='{pick['agent_id']}']", pick["visible"]):
+            filled[f"choice:{name[:24]}"] = _option_text(pick).strip()[:40]
+            picked_groups.add(name)
 
     # Required radio groups - "Please select a vehicle brand", "preferred
     # dealer". Left blank the form is rejected and the site falls back to
     # email, which is how a contactable business ends up emailed instead.
     # There is no good answer to give, so take the first real option.
+    # Custom-styled radios hide their inputs like checkboxes do (hestonhydehotel
+    # .com, "Telephone / Email", 2026-09-25), so a required one counts even
+    # when it cannot be seen.
     groups: dict[str, list[dict]] = {}
     for field in form["fields"]:
-        if field["type"] != "radio" or not field["visible"]:
+        if field["type"] != "radio" or not fillable(field):
             continue
         groups.setdefault(field.get("name") or field["agent_id"], []).append(field)
 
     for name, options in groups.items():
-        if any(o.get("checked") for o in options):
-            continue                       # the site already picked one
+        if name in picked_groups or any(o.get("checked") for o in options):
+            continue                       # already chosen - by the site or above
         if not any(o["required"] for o in options):
             continue                       # optional - leave it alone
+        if truthful_only:
+            # Only a general-enquiry / business option is honest; a "which pest?"
+            # or "preferred date" radio has no true answer for us, so tick
+            # nothing and flag the row for a person.
+            pick = next((o for o in options
+                         if (PREFERRED_OPTION_RE.search(o["desc"]) or GENERAL_OPTION_RE.search(o["desc"])
+                             or BUSINESS_OPTION_RE.search(o["desc"]))
+                         and not AVOID_OPTION_RE.search(o["desc"])
+                         and not SKIP_OPTION_RE.search(o["desc"])), None)
+            if not pick:
+                missing_required.append(f"choice needs a person: {name[:40]}")
+                needs_human.append(f"choice: {name[:40]}")
+                continue
+            if await _tick(frame, f"[data-agent-id='{pick['agent_id']}']", pick["visible"]):
+                filled[f"radio:{name[:24]}"] = pick["desc"][:40]
+            continue
         for option in options:
             if SKIP_OPTION_RE.search(option["desc"]):
                 continue                   # not "other", which usually opens a text box
-            try:
-                await frame.check(f"[data-agent-id='{option['agent_id']}']", timeout=4000)
+            if await _tick(frame, f"[data-agent-id='{option['agent_id']}']", option["visible"]):
                 filled[f"radio:{name[:24]}"] = option["desc"][:40]
                 break
-            except Exception:
-                continue
 
     # Last resort for a required field we could not name. Every site invents its
     # own ("leadtypeid", "dropdown_1", "new_customer_select", "model"), and one
@@ -428,7 +612,112 @@ async def fill_form(frame, form: dict, cfg, ctx: dict, env, subject: str) -> dic
         except Exception:  # noqa: BLE001
             missing_required.append(desc[:60] or field["type"])
 
-    return {"filled": filled, "roles": list(roles), "missing_required": missing_required}
+    # A value set without keystrokes can leave a site's own validation behind.
+    # stghotel.com kept "Please fill out this field." under a Subject box that
+    # plainly held the subject, and concept-apartments.co.uk (Contact Form 7)
+    # kept "The field is required." under a filled email box, 2026-09-25: both
+    # re-check on keyup or change, which a programmatic fill never fires. Type
+    # those values again, key by key, and leave the box so change fires.
+    # A phone box can refuse the number however it is typed: then try the
+    # other ways of writing it until the box accepts one.
+    phone_ids = {f["agent_id"] for f in form["fields"]
+                 if f.get("type") == "tel" or f is roles.get("phone")}
+    for agent_id in await _invalid_with_value(frame, form["form_key"]):
+        loc = frame.locator(f"[data-agent-id='{agent_id}']")
+        try:
+            value = await loc.input_value(timeout=2000)
+            tries = [value]
+            if agent_id in phone_ids and values.get("phone"):
+                tries += phone_variants(values["phone"])
+            for attempt in tries:
+                await loc.fill("", timeout=3000)
+                await loc.press_sequentially(attempt, timeout=60000)
+                await loc.press("Tab", timeout=2000)
+                filled[f"retyped:{agent_id}"] = attempt[:40]
+                if agent_id not in await _invalid_with_value(frame, form["form_key"]):
+                    break
+        except Exception:  # noqa: BLE001
+            continue
+
+    # A phone box whose site refused the number in its own way: type it the
+    # other ways until the site stops complaining (+44... first, then 02...).
+    if values.get("phone"):
+        for field in form["fields"]:
+            if field["agent_id"] not in phone_ids or not fillable(field):
+                continue
+            sel = f"[data-agent-id='{field['agent_id']}']"
+            # Most sites judge a phone box when it loses focus, and a value set
+            # by script never makes it lose focus - leave it first, as a person
+            # tabbing on would, so the site has had its say before we look.
+            try:
+                await frame.eval_on_selector(sel, """el => {
+                  for (const t of ['input', 'change']) el.dispatchEvent(new Event(t, {bubbles: true}));
+                  el.dispatchEvent(new FocusEvent('blur')); el.dispatchEvent(new FocusEvent('focusout', {bubbles: true}));
+                }""")
+                await frame.wait_for_timeout(400)
+            except Exception:  # noqa: BLE001
+                pass
+            if not await _phone_refused(frame, sel):
+                continue
+            loc = frame.locator(sel)
+            for attempt in phone_variants(values["phone"]):
+                try:
+                    await loc.fill("", timeout=3000)
+                    await loc.press_sequentially(attempt, timeout=30000)
+                    await loc.press("Tab", timeout=2000)
+                    await frame.wait_for_timeout(400)
+                except Exception:  # noqa: BLE001
+                    break
+                filled[f"phone-as:{field['agent_id']}"] = attempt
+                if not await _phone_refused(frame, sel):
+                    break
+
+    return {"filled": filled, "roles": list(roles), "missing_required": missing_required,
+            "needs_human": needs_human}
+
+
+def phone_variants(phone: str) -> list[str]:
+    """The same number written the other ways phone boxes insist on.
+
+    "+442034112329" is refused by boxes that take digits only, by UK boxes
+    that want 0 and ten digits, and by ones that already show +44 in front -
+    a care-home form turned Pest Stop's number away, 2026-09-29.
+    """
+    digits = re.sub(r"\D", "", phone)
+    out: list[str] = []
+    if digits.startswith("44") and len(digits) >= 11:
+        out += ["0" + digits[2:], digits[2:]]          # 02034112329, 2034112329
+    if digits:
+        out.append(digits)                             # 442034112329
+    return [v for v in dict.fromkeys(out) if v != phone]
+
+
+# Is this phone box refusing what it holds? Not only the browser's own check:
+# plenty of sites mark the box (aria-invalid, an "error" class) or print their
+# own "Please enter a valid phone number" beside it after it loses focus.
+PHONE_REFUSED_JS = r"""(el) => {
+  if (!el.checkValidity()) return true;
+  if (el.getAttribute('aria-invalid') === 'true') return true;
+  if (/(^|\s)(error|invalid|is-invalid|has-error|wpcf7-not-valid|parsley-error)(\s|$)/i.test(el.className)) return true;
+  const box = el.closest('.form-group, .field, .gfield, .wpcf7-form-control-wrap, p, li, div') || el.parentElement;
+  const text = box ? box.innerText : '';
+  return /(valid|correct|proper).{0,25}(phone|telephone|mobile|number)|(phone|telephone|mobile|number).{0,40}(invalid|not valid|incorrect|not recogni)/i.test(text);
+}"""
+
+
+async def _phone_refused(frame, sel: str) -> bool:
+    try:
+        return bool(await frame.eval_on_selector(sel, PHONE_REFUSED_JS))
+    except Exception:
+        return False
+
+
+async def _invalid_with_value(frame, form_key: str) -> list[str]:
+    try:
+        return await frame.eval_on_selector(
+            f"form[data-agent-form='{form_key}']", INVALID_WITH_VALUE_JS) or []
+    except Exception:
+        return []
 
 
 # Budget/quantity boxes where a made-up number is worse than an unsent form, and
@@ -459,18 +748,34 @@ def _last_resort_value(field: dict, values: dict, desc: str) -> str:
     return values.get("company", "")
 
 
+SOURCE_OPTION_RE = re.compile(r"google|search|internet|online|\bweb", re.I)
+
+
 async def _select_best(frame, sel, field, role, value):
-    """Choose the option whose text best matches, else the first real option."""
+    """Choose the option whose text best matches, else the most sensible one.
+
+    "The first real option" used to be the fallback, which for an enquiry-type
+    select is often "Book a visit", and for a county one "Aberdeenshire".
+    """
     opts = [o for o in field["options"] if o["value"]]
     if not opts:
         return
     target = value.lower()
     for o in opts:
-        if target and target in (o["text"] or "").lower():
+        text = (o["text"] or "").lower().strip()
+        # "Greater London" matches an option "London" as well as the reverse.
+        if target and text and (target in text or (len(text) >= 4 and text in target)):
             await _set_value(frame, sel, o["value"], is_select=True)
             return
-    real = [o for o in opts if o["value"] not in {"0", "-1", ""}]
-    await _set_value(frame, sel, (real or opts)[0]["value"], is_select=True)
+    real = [o for o in opts if o["value"] not in {"0", "-1", ""}] or opts
+    fits = lambda rx: next((o for o in real if rx.search(o["text"] or "")
+                            and not AVOID_OPTION_RE.search(o["text"] or "")), None)
+    pick = ((fits(SOURCE_OPTION_RE) if role == "heard_about" else None)
+            or fits(GENERAL_OPTION_RE) or fits(PREFERRED_OPTION_RE) or fits(BUSINESS_OPTION_RE)
+            or next((o for o in real if not SKIP_OPTION_RE.search(o["text"] or "")
+                     and not AVOID_OPTION_RE.search(o["text"] or "")), None)
+            or real[0])
+    await _set_value(frame, sel, pick["value"], is_select=True)
 
 
 async def submit_form(frame, form_key: str, timeout_ms: int) -> str:
@@ -535,6 +840,79 @@ def _fresh_confirmation(body: str, before_body: str) -> tuple[str | None, str] |
     return (None, stale) if stale else None
 
 
+def _fresh_error(body: str, before_body: str) -> str | None:
+    """An error phrase that was NOT already on the page before submitting.
+
+    "required", "please select" and "invalid" sit on plenty of pages from the
+    start - a Cookiebot banner ("...may also be required"), a "- Please
+    select -" dropdown placeholder, a "(required)" label. Matching those
+    anywhere reported the banner as the form's error on every Clermont hotel,
+    2026-09-25, and would fail a form that had in fact gone through.
+    """
+    before = _norm(before_body)
+    for match in ERROR_TEXT_RE.finditer(body):
+        probe = _norm(body[max(0, match.start() - 25): match.end() + 25])
+        if before and probe in before:
+            continue
+        return body[max(0, match.start() - 60): match.end() + 60].replace("\n", " ").strip()[:140]
+    return None
+
+
+# How many text-like controls in the form still hold a value.
+FILLED_COUNT_JS = r"""(form) => {
+  let n = 0;
+  for (const el of form.elements) {
+    const t = (el.type || '').toLowerCase();
+    if (el.tagName === 'TEXTAREA' || ['text', 'email', 'tel', ''].includes(t)) {
+      if (el.tagName !== 'SELECT' && (el.value || '').trim()) n++;
+    }
+  }
+  return n;
+}"""
+
+
+async def _form_was_cleared(scope, form_key: str) -> bool:
+    """Every text box we filled is empty again - the site reset the form.
+
+    Only called after the pre-submit validity check passed, so the browser
+    had nothing to block. An AJAX form that clears itself after posting then
+    reports every required box as empty, which read as "browser rejected the
+    form" - seen on georgianhousehotel.co.uk (which also said "Your submission
+    was successful") and lensbury.com, 2026-09-25.
+    """
+    try:
+        return await scope.eval_on_selector(
+            f"form[data-agent-form='{form_key}']", FILLED_COUNT_JS) == 0
+    except Exception:
+        return False
+
+
+# A CAPTCHA that only appears once Submit is pressed (Wix shows "Verification
+# - Please confirm you're human"). 270 such blocked submissions had been
+# recorded as "probably sent" before this existed, 2026-10-01.
+CHALLENGE_TEXT_RE = re.compile(
+    r"confirm you.{0,4}r?e? (a )?human|verify (that )?you are (a )?human|are you a robot|"
+    r"i'?m not a robot|complete the (captcha|security check)", re.I)
+
+
+async def _challenge_after_submit(page, body: str, before_body: str) -> str:
+    before = _norm(before_body)
+    for hit in CHALLENGE_TEXT_RE.finditer(body):
+        probe = _norm(body[max(0, hit.start() - 25): hit.end() + 25])
+        if not before or probe not in before:
+            return hit.group(0)
+    try:
+        for f in page.frames:
+            if re.search(r"recaptcha/api2/bframe|hcaptcha\.com/.*challenge", f.url or ""):
+                el = await f.frame_element()
+                box = await el.bounding_box()
+                if box and box["width"] > 50 and box["height"] > 50 and await el.is_visible():
+                    return "picture challenge"
+    except Exception:
+        pass
+    return ""
+
+
 async def verify_submission(page, frame, before_url: str, form_key: str,
                             before_body: str = "") -> tuple[str, str, str]:
     """Best-effort read of whether the submission landed.
@@ -561,6 +939,10 @@ async def verify_submission(page, frame, before_url: str, form_key: str,
     if after_url != before_url and re.search(r"thank|success|sent|submitted", after_url, re.I):
         return "success", f"redirected to {after_url}", "strong"
 
+    challenge = await _challenge_after_submit(page, body, before_body)
+    if challenge:
+        return "failed", f"a CAPTCHA appeared after submit ('{challenge}') - not sent", "strong"
+
     fresh = _fresh_confirmation(body, before_body)
     stale_note = ""
     if fresh:
@@ -570,16 +952,19 @@ async def verify_submission(page, frame, before_url: str, form_key: str,
         stale_note = (f" (ignored '{stale}' - already on the page before submitting)"
                       if stale else "")
 
-    if ERROR_TEXT_RE.search(body):
-        match = ERROR_TEXT_RE.search(body)
-        snippet = body[max(0, match.start() - 60): match.end() + 60].replace("\n", " ")
-        return "failed", f"validation error: {snippet.strip()[:140]}", "strong"
+    error = _fresh_error(body, before_body)
+    if error:
+        return "failed", f"validation error: {error}", "strong"
 
     scope = frame if frame is not None else page
 
     # The browser refusing the submit leaves the form in place with its
-    # invalid fields flagged - the clearest evidence nothing was sent.
+    # invalid fields flagged - the clearest evidence nothing was sent. Unless
+    # the form is empty: a refused submit keeps what we typed, a reset one
+    # does not.
     rejected = await invalid_fields(scope, form_key)
+    if rejected and await _form_was_cleared(scope, form_key):
+        return "uncertain", f"form cleared after submit - likely sent, no confirmation{stale_note}", "weak"
     if rejected:
         return "failed", f"browser rejected the form: {rejected}{stale_note}", "strong"
 
