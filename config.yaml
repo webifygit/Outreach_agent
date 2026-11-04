@@ -144,6 +144,21 @@ scripts:
       body_template_path: "templates/pest_control/email_body.txt.j2"
       html_template_path: ""
 
+  - key: webify_general
+    label: "Webify - general digital growth (Webify.ai)"
+    blurb: "Digital marketing, web/app development & AI solutions - any industry"
+    form:
+      subject_line: "Helping {{ company_name or 'your business' }} reach more potential customers"
+      message_tiers:
+        full: "templates/webify_general/form_message_full.txt.j2"
+        medium: "templates/webify_general/form_message_medium.txt.j2"
+        short: "templates/webify_general/form_message_700.txt.j2"
+        shortest: "templates/webify_general/form_message_500.txt.j2"
+    email:
+      subject_template: "Helping {{ company_name or 'your business' }} reach more potential customers"
+      body_template_path: "templates/webify_general/email_body.txt.j2"
+      html_template_path: ""
+
 form:
   subject_line: "Partnership enquiry"
   # Rendered with Jinja2 - same variables as the email template. The agent
